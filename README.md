@@ -35,12 +35,25 @@ The optional progress bar uses `tqdm`:
 python3 -m pip install tqdm
 ```
 
+If you use a virtual environment, either activate it before running the tool or
+point the wrapper at its Python interpreter:
+
+```sh
+export CHECK_ADS_BIB_PYTHON=/path/to/venv/bin/python3
+```
+
 ## Usage
 
 Check a bibliography:
 
 ```sh
 ./check_ads_bib.sh path/to/ref.bib
+```
+
+You can also call the Python script directly:
+
+```sh
+python3 check_ads_bib.py path/to/ref.bib
 ```
 
 Review and replace problematic entries interactively:
