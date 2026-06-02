@@ -1008,26 +1008,33 @@ def prompt_replacement_choice(entry_key: str, has_ads_replacement: bool) -> str:
             print("Please enter 1 for ADS, 2 for manual, or 3 to skip.")
         else:
             print("  1. Paste manual replacement [default]")
-            print("  2. Skip")
-            answer = input("Select 1 or 2 [1]: ").strip().lower()
+            print("  2. Use ADS replacement (unavailable)")
+            print("  3. Skip")
+            answer = input("Select 1 or 3 [1]: ").strip().lower()
             if answer in {"", "1", "manual", "m", "paste", "p", "replace", "r", "y", "yes"}:
                 return "manual"
-            if answer in {"2", "skip", "s", "n", "no"}:
+            if answer in {"3", "skip", "s", "n", "no"}:
                 return "skip"
-            print("Please enter 1 for manual replacement or 2 to skip.")
+            if answer == "2":
+                print("ADS replacement is unavailable for this entry.")
+                continue
+            print("Please enter 1 for manual replacement or 3 to skip.")
 
 
-def prompt_manual_replacement_choice(entry_key: str) -> bool:
+def prompt_manual_replacement_choice(entry_key: str) -> str:
     while True:
         print(f"\nUse pasted replacement for {entry_key}?")
         print("  1. Replace [default]")
-        print("  2. Skip")
-        answer = input("Select 1 or 2 [1]: ").strip().lower()
+        print("  2. Paste again")
+        print("  3. Skip")
+        answer = input("Select 1, 2, or 3 [1]: ").strip().lower()
         if answer in {"", "1", "replace", "r", "y", "yes"}:
-            return True
-        if answer in {"2", "skip", "s", "n", "no"}:
-            return False
-        print("Please enter 1 to replace or 2 to skip.")
+            return "replace"
+        if answer in {"2", "again", "retry", "manual", "m", "paste", "p"}:
+            return "again"
+        if answer in {"3", "skip", "s", "n", "no"}:
+            return "skip"
+        print("Please enter 1 to replace, 2 to paste again, or 3 to skip.")
 
 
 def prompt_replacement_session() -> bool:
@@ -1252,7 +1259,10 @@ def replace_outdated_entries(
             replacement = replace_bibtex_key(pasted, current_entry.key)
             print_bibtex_block("Pasted Replacement", replacement)
             print("\n" + "-" * 100)
-            if not prompt_manual_replacement_choice(current_entry.key):
+            manual_choice = prompt_manual_replacement_choice(current_entry.key)
+            if manual_choice == "again":
+                continue
+            if manual_choice == "skip":
                 print(f"Skipped {current_entry.key}.")
                 break
 
