@@ -1,4 +1,4 @@
-# CheckCitation
+# Tool to check citations against ADS
 
 Small CLI for checking whether BibTeX entries resolve on NASA ADS and match the
 BibTeX currently exported by ADS.
@@ -10,6 +10,24 @@ Create an ADS API token from your ADS account and expose it as:
 ```sh
 export ADS_API_TOKEN="..."
 ```
+
+To make the token available in every new shell, add the same line to your shell
+startup file. For example, zsh users can add it to `~/.zshrc`:
+
+```sh
+echo 'export ADS_API_TOKEN="..."' >> ~/.zshrc
+source ~/.zshrc
+```
+
+For bash, use `~/.bashrc` instead:
+
+```sh
+echo 'export ADS_API_TOKEN="..."' >> ~/.bashrc
+source ~/.bashrc
+```
+
+ADS documents its current API rate-limit policy at
+<https://ui.adsabs.harvard.edu/help/policies/rate-limits>.
 
 The optional progress bar uses `tqdm`:
 

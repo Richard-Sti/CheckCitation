@@ -311,10 +311,13 @@ def active_ads_rate_limit() -> float | None:
 
 def strip_wrappers(value: str) -> str:
     value = value.strip().rstrip(",").strip()
-    if len(value) >= 2 and value[0] == "{" and value[-1] == "}":
-        value = value[1:-1]
-    elif len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-        value = value[1:-1]
+    while len(value) >= 2:
+        if value[0] == "{" and value[-1] == "}":
+            value = value[1:-1].strip()
+        elif value[0] == '"' and value[-1] == '"':
+            value = value[1:-1].strip()
+        else:
+            break
     return " ".join(value.replace("\n", " ").split())
 
 
