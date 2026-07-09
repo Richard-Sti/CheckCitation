@@ -29,6 +29,18 @@ except ImportError:
     tqdm = None
 
 
+# ponytail: raw ANSI, no dependency; honour NO_COLOR and non-tty output.
+PROMPT_COLOR = "\033[1;36m"  # bold cyan: interactive questions
+UNAVAILABLE_COLOR = "\033[1;91m"  # bold bright red: no replacement available
+_RESET = "\033[0m"
+
+
+def colorize(text: str, code: str) -> str:
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return text
+    return f"{code}{text}{_RESET}"
+
+
 ADS_API = "https://api.adsabs.harvard.edu/v1/search/query"
 ADS_BIBTEX_API = "https://api.adsabs.harvard.edu/v1/export/bibtex"
 DEFAULT_JOBS = 1
@@ -1001,7 +1013,7 @@ def prompt_replacement_choice(entry_key: str, has_ads_replacement: bool) -> str:
             print("  1. Use ADS replacement [default]")
             print("  2. Paste manual replacement")
             print("  3. Skip")
-            answer = input("Select 1, 2, or 3 [1]: ").strip().lower()
+            answer = input(colorize("Select 1, 2, or 3 [1]: ", PROMPT_COLOR)).strip().lower()
             if answer in {"", "1", "ads", "replace", "r", "y", "yes"}:
                 return "ads"
             if answer in {"2", "manual", "m", "paste", "p"}:
@@ -1011,15 +1023,15 @@ def prompt_replacement_choice(entry_key: str, has_ads_replacement: bool) -> str:
             print("Please enter 1 for ADS, 2 for manual, or 3 to skip.")
         else:
             print("  1. Paste manual replacement [default]")
-            print("  2. Use ADS replacement (unavailable)")
+            print(colorize("  2. Use ADS replacement (unavailable)", UNAVAILABLE_COLOR))
             print("  3. Skip")
-            answer = input("Select 1 or 3 [1]: ").strip().lower()
+            answer = input(colorize("Select 1 or 3 [1]: ", PROMPT_COLOR)).strip().lower()
             if answer in {"", "1", "manual", "m", "paste", "p", "replace", "r", "y", "yes"}:
                 return "manual"
             if answer in {"3", "skip", "s", "n", "no"}:
                 return "skip"
             if answer == "2":
-                print("ADS replacement is unavailable for this entry.")
+                print(colorize("ADS replacement is unavailable for this entry.", UNAVAILABLE_COLOR))
                 continue
             print("Please enter 1 for manual replacement or 3 to skip.")
 
@@ -1030,7 +1042,7 @@ def prompt_manual_replacement_choice(entry_key: str) -> str:
         print("  1. Replace [default]")
         print("  2. Paste again")
         print("  3. Skip")
-        answer = input("Select 1, 2, or 3 [1]: ").strip().lower()
+        answer = input(colorize("Select 1, 2, or 3 [1]: ", PROMPT_COLOR)).strip().lower()
         if answer in {"", "1", "replace", "r", "y", "yes"}:
             return "replace"
         if answer in {"2", "again", "retry", "manual", "m", "paste", "p"}:
@@ -1042,7 +1054,7 @@ def prompt_manual_replacement_choice(entry_key: str) -> str:
 
 def prompt_replacement_session() -> bool:
     while True:
-        answer = input("\nProceed with replacement? [y/N]: ").strip().lower()
+        answer = input(colorize("\nProceed with replacement? [y/N]: ", PROMPT_COLOR)).strip().lower()
         if answer in {"y", "yes"}:
             return True
         if answer in {"", "n", "no"}:
@@ -1056,7 +1068,7 @@ def prompt_manual_bibtex(entry_key: str) -> str | None:
     print("  You can also end the pasted entry with a line containing only '.'.")
     print("  Type 'skip' or press Enter on the first line to skip this entry.")
 
-    first_line = input("BibTeX> ")
+    first_line = input(colorize("BibTeX> ", PROMPT_COLOR))
     if not first_line.strip():
         return None
     if first_line.strip().lower() in {"s", "skip"}:
@@ -1064,7 +1076,7 @@ def prompt_manual_bibtex(entry_key: str) -> str | None:
 
     lines = [first_line]
     while True:
-        line = input("... ")
+        line = input(colorize("... ", PROMPT_COLOR))
         if line.strip() == ".":
             break
         if not line.strip():
@@ -1156,7 +1168,7 @@ def replace_outdated_entries(
 
     if not candidates:
         print("\nReplacement")
-        print("  No automatic or manual replacement candidates were found.")
+        print(colorize("  No automatic or manual replacement candidates were found.", UNAVAILABLE_COLOR))
         return 0
 
     counts: dict[str, int] = {}
@@ -1222,9 +1234,9 @@ def replace_outdated_entries(
                 try:
                     ads_bibtex = ads_export_bibtex(bibcode, token, timeout)
                 except AdsRateLimitError as exc:
-                    print(f"\nADS replacement unavailable for {current_entry.key}: ADS API rate limit is active: {exc}")
+                    print(colorize(f"\nADS replacement unavailable for {current_entry.key}: ADS API rate limit is active: {exc}", UNAVAILABLE_COLOR))
                 except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                    print(f"\nADS replacement unavailable for {current_entry.key}: could not fetch ADS BibTeX for {bibcode}: {exc}")
+                    print(colorize(f"\nADS replacement unavailable for {current_entry.key}: could not fetch ADS BibTeX for {bibcode}: {exc}", UNAVAILABLE_COLOR))
             if ads_bibtex:
                 ads_replacement = replace_bibtex_key(ads_bibtex, current_entry.key)
                 print_detail("ADS bibcode", bibcode, indent="  ")
