@@ -19,6 +19,7 @@ import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from threading import Event, Lock
 from typing import TypeVar
@@ -53,6 +54,16 @@ DEFAULT_CACHE_TTL = 24 * 60 * 60
 BIBCODE_RE = re.compile(r"/abs/([^/?#]+)")
 ENTRY_RE = re.compile(r"@(?P<kind>[A-Za-z]+)\s*{\s*(?P<key>[^,\s]+)\s*,", re.M)
 FIELD_RE = re.compile(r"(?P<name>[A-Za-z][A-Za-z0-9_-]*)\s*=", re.M)
+SKIP_DIRECTIVE_RE = re.compile(r"^\s*%+\s*checkcitation:\s*skip\b", re.I)
+LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+\s*")
+NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
+AUTHOR_SPLIT_RE = re.compile(r"\s+and\s+", re.I)
+# Surname plus a four-digit year, optionally disambiguated (Dutton2007a).
+CITATION_KEY_RE = re.compile(r"^(?P<name>[A-Za-z][A-Za-z'\-]*)(?P<year>\d{4})[a-z]?$")
+CITE_RE = re.compile(r"\\[A-Za-z]*cite[A-Za-z]*\s*(?:\[[^\]]*\]\s*)*\{(?P<keys>[^}]*)\}")
+TEX_COMMENT_RE = re.compile(r"(?<!\\)%.*")
+# ponytail: 0.85 on an alphanumeric reduction; tighten only if real mismatches slip through.
+TITLE_SIMILARITY_THRESHOLD = 0.85
 STATUS_ORDER = (
     "OK",
     "ADS_BIBTEX_MISMATCH",
@@ -85,7 +96,7 @@ ISSUE_STATUSES = {
 ISSUE_DESCRIPTIONS = {
     "ADS_BIBTEX_MISMATCH": "the local entry has ADS provenance, but its BibTeX fields differ from the current ADS export",
     "NON_ADS_BIBTEX": "the entry resolves to ADS, but it has no local ADS bibcode or adsurl",
-    "ADS_RECORD_CONFLICT": "the local ADS bibcode points to an ADS export whose title, DOI, or eprint disagrees with the local entry",
+    "ADS_RECORD_CONFLICT": "the resolved ADS record disagrees with the local entry on title, author, DOI, eprint, or citation key",
     "IDENTIFIER_CONFLICT": "different identifiers in this entry resolve to different ADS records",
     "BIBCODE_MISMATCH": "the local ADS bibcode and DOI/arXiv/title lookup point to different ADS records",
     "IDENTIFIER_MISMATCH": "at least one identifier resolves to ADS, but another identifier in the same entry does not",
@@ -146,6 +157,7 @@ class BibEntry:
     start: int
     end: int
     raw: str
+    skip: bool = False
 
 
 @dataclass(frozen=True)
@@ -407,9 +419,18 @@ def parse_bibtex_text(text: str) -> list[BibEntry]:
                 start=match.start(),
                 end=end,
                 raw=raw,
+                skip=has_skip_directive(text, match.start()),
             )
         )
     return entries
+
+
+def has_skip_directive(text: str, start: int) -> bool:
+    """True when the last non-blank line before an entry is `% checkcitation: skip`."""
+    preceding = text[:start].rstrip()
+    if not preceding:
+        return False
+    return bool(SKIP_DIRECTIVE_RE.match(preceding.rsplit("\n", 1)[-1]))
 
 
 def parse_bibtex(path: Path) -> list[BibEntry]:
@@ -468,6 +489,27 @@ def identifier_query_groups(entry: BibEntry, include_bibcode: bool) -> list[tupl
     return groups
 
 
+def match_title(match: dict[str, object]) -> str:
+    title = match.get("title") or [""]
+    return title[0] if isinstance(title, list) and title else str(title)
+
+
+def is_arxiv_bibcode(bibcode: str) -> bool:
+    return len(bibcode) >= 9 and bibcode[4:9] == "arXiv"
+
+
+def preferred_match(matches: list[dict[str, object]]) -> dict[str, object] | None:
+    """Collapse an arXiv/refereed pair of the same paper to the refereed record.
+
+    Returns None whenever the candidates are not plainly the same paper, so
+    genuinely ambiguous lookups still surface as AMBIGUOUS.
+    """
+    if len({alphanumeric_key(match_title(match)) for match in matches}) != 1:
+        return None
+    refereed = [match for match in matches if not is_arxiv_bibcode(str(match.get("bibcode", "")))]
+    return refereed[0] if len(refereed) == 1 else None
+
+
 def run_queries(
     queries: list[tuple[str, str]],
     token: str,
@@ -491,6 +533,8 @@ def run_queries(
         if len(matches) == 1:
             return AdsResult("OK", query, matches)
         if len(matches) > 1:
+            if (preferred := preferred_match(matches)) is not None:
+                return AdsResult("OK", query, [preferred])
             return AdsResult("AMBIGUOUS", query, matches)
         messages.append(f"{label}:0")
 
@@ -622,19 +666,90 @@ def parsed_ads_entry(entry: BibEntry, ads_bibtex: str) -> BibEntry | None:
 
 
 def normalized_identity_value(value: str) -> str:
-    value = value.replace("{", "").replace("}", "")
-    value = value.replace("\\&", "&")
+    value = LATEX_COMMAND_RE.sub(" ", value)  # \ensuremath, \sc, \textit, \approx
+    value = re.sub(r"\\(.)", r"\1", value)  # \&, \_, \%
+    for char in "{}$":
+        value = value.replace(char, " ")
     return " ".join(value.casefold().split())
+
+
+def alphanumeric_key(value: str) -> str:
+    return NON_ALNUM_RE.sub("", normalized_identity_value(value))
+
+
+def title_similarity(local: str, ads: str) -> float:
+    """Similarity of two titles after LaTeX stripping, ignoring punctuation and markup."""
+    left = alphanumeric_key(local)
+    right = alphanumeric_key(ads)
+    if not left or not right:
+        return 1.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def first_author_surname(author: str) -> str:
+    """Alphanumeric surname of the first author.
+
+    Falls back to the whole name when there is no `Surname, Given` comma, so that
+    corporate authors ("Planck Collaboration") stay matchable by substring.
+    """
+    first = AUTHOR_SPLIT_RE.split(author.strip(), maxsplit=1)[0]
+    if "," in first:
+        first = first.split(",", 1)[0]
+    return alphanumeric_key(first)
+
+
+def names_agree(left: str, right: str) -> bool:
+    """Substring match either way, so `vanDenBosch` and `Planck` survive."""
+    if not left or not right:
+        return True
+    return left in right or right in left
+
+
+def key_conflicts(key: str, ads_entry: BibEntry) -> bool:
+    """True when a `Surname2020`-style key disagrees with the resolved ADS record.
+
+    This is the only signal independent of the entry's own fields, so it is what
+    catches an internally consistent entry that is simply the wrong paper.
+    """
+    match = CITATION_KEY_RE.match(key)
+    if not match:
+        return False
+    if not names_agree(NON_ALNUM_RE.sub("", match.group("name").casefold()), first_author_surname(ads_entry.fields.get("author", ""))):
+        return True
+    ads_year = ads_entry.fields.get("year", "")
+    # ponytail: +/-1 absorbs preprint-vs-journal year drift.
+    return ads_year.isdigit() and abs(int(ads_year) - int(match.group("year"))) > 1
 
 
 def identity_conflicts(entry: BibEntry, ads_entry: BibEntry) -> list[str]:
     conflicts: list[str] = []
-    for field in ("title", "doi", "eprint"):
+
+    local_title = entry.fields.get("title")
+    ads_title = ads_entry.fields.get("title")
+    if local_title and ads_title and title_similarity(local_title, ads_title) < TITLE_SIMILARITY_THRESHOLD:
+        conflicts.append("title")
+
+    for field in ("doi", "eprint"):
         local = entry.fields.get(field)
         ads = ads_entry.fields.get(field)
         if local and ads and normalized_identity_value(local) != normalized_identity_value(ads):
             conflicts.append(field)
+
+    local_author = entry.fields.get("author")
+    ads_author = ads_entry.fields.get("author")
+    if local_author and ads_author and not names_agree(first_author_surname(local_author), first_author_surname(ads_author)):
+        conflicts.append("author")
+
+    if key_conflicts(entry.key, ads_entry):
+        conflicts.append("key")
+
     return conflicts
+
+
+def malformed_author(entry: BibEntry) -> bool:
+    """True for a literal `{et al.}` author, which renders as `(Smith & et al. 2020)`."""
+    author = entry.fields.get("author", "")
+    return any(alphanumeric_key(part) == "etal" for part in AUTHOR_SPLIT_RE.split(author))
 
 
 def identifier_consensus(
@@ -697,7 +812,19 @@ def bibtex_matches_ads(entry: BibEntry, ads_entry: BibEntry) -> bool:
     return comparable_fields(entry) == comparable_fields(ads_entry)
 
 
-def verify_ads_bibtex(entry: BibEntry, bibcode: str, result: AdsResult, token: str, timeout: float) -> AdsResult:
+def verify_ads_bibtex(
+    entry: BibEntry,
+    bibcode: str,
+    result: AdsResult,
+    token: str,
+    timeout: float,
+    local_bibcode: bool = True,
+) -> AdsResult:
+    """Fetch the ADS export for `bibcode` and gate it behind the identity check.
+
+    Every path that resolves an entry to an ADS record goes through here, so an
+    entry that resolves to the wrong paper cannot be offered as a replacement.
+    """
     try:
         ads_bibtex = ads_export_bibtex(bibcode, token, timeout)
     except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
@@ -714,6 +841,15 @@ def verify_ads_bibtex(entry: BibEntry, bibcode: str, result: AdsResult, token: s
             result.query,
             result.matches,
             f"local {'/'.join(conflicts)} differs from ADS export for {bibcode}; manual review required",
+            ads_bibtex=ads_bibtex,
+        )
+
+    if not local_bibcode:
+        return AdsResult(
+            "NON_ADS_BIBTEX",
+            result.query,
+            result.matches,
+            f"entry resolves to ADS bibcode {bibcode}, but has no local adsurl/bibcode",
             ads_bibtex=ads_bibtex,
         )
 
@@ -761,17 +897,7 @@ def check_entry_live(entry: BibEntry, token: str, rows: int, timeout: float, sle
         result = identifier_consensus(consensus_groups, token, rows, timeout, sleep) if consensus_groups else run_queries(fallback_queries, token, rows, timeout, sleep)
         if result.status == "OK":
             bibcode = str(result.matches[0].get("bibcode", ""))
-            try:
-                ads_bibtex = ads_export_bibtex(bibcode, token, timeout)
-            except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                return AdsResult("ERROR", result.query, result.matches, f"could not fetch ADS BibTeX for {bibcode}: {exc}")
-            return AdsResult(
-                "NON_ADS_BIBTEX",
-                result.query,
-                result.matches,
-                f"entry resolves to ADS bibcode {bibcode}, but has no local adsurl/bibcode",
-                ads_bibtex=ads_bibtex,
-            )
+            return verify_ads_bibtex(entry, bibcode, result, token, timeout, local_bibcode=False)
         return result
 
     consensus = identifier_consensus(consensus_groups, token, rows, timeout, sleep)
@@ -796,9 +922,7 @@ def check_entry(
 def format_match(match: dict[str, object]) -> str:
     bibcode = str(match.get("bibcode", ""))
     year = str(match.get("year", ""))
-    title_value = match.get("title") or [""]
-    title = title_value[0] if isinstance(title_value, list) and title_value else str(title_value)
-    return f"{bibcode} {year} {title}".strip()
+    return f"{bibcode} {year} {match_title(match)}".strip()
 
 
 def print_detail(label: str, value: str, indent: str = "    ", label_width: int = 11) -> None:
@@ -870,19 +994,19 @@ def replacement_bibcode(result: AdsResult) -> str | None:
 
 
 def print_replacement_suggestion(entry: BibEntry, result: AdsResult) -> None:
+    if result.status == "ADS_RECORD_CONFLICT":
+        if bibcode := replacement_bibcode(result):
+            print_detail(
+                "Suggestion",
+                f"ADS export for {bibcode} is available, but compare it manually before replacing because it may be a different paper",
+            )
+        return
+
     if bibcode := ads_replacement_bibcode(result):
         print_detail(
             "Suggestion",
             f"review the ADS export for {bibcode}; run with --replace to choose ADS, paste manual, or skip while keeping key {entry.key}",
         )
-        return
-
-    if result.status == "ADS_RECORD_CONFLICT":
-        if bibcode := replacement_bibcode(result):
-            print_detail(
-                "Suggestion",
-                f"ADS export for {bibcode} is available, but compare it manually before replacing because title, DOI, or eprint conflicts",
-            )
         return
 
     if result.status in {"IDENTIFIER_MISMATCH", "BIBCODE_MISMATCH"} and result.matches:
@@ -1004,6 +1128,39 @@ def ads_replacement_bibcode(result: AdsResult) -> str | None:
     if len(bibcodes) == 1:
         return next(iter(bibcodes))
     return None
+
+
+def prompt_risky_replacement_choice(entry_key: str, conflicts: list[str]) -> str:
+    """Replacement menu for a candidate that may be a different paper.
+
+    Defaults to skip and demands a typed confirmation, so a formatting refresh
+    stays one keypress away while overwriting a mismatched entry does not.
+    """
+    while True:
+        print(f"\nReplacement choice for {entry_key}:")
+        print(colorize(f"  The ADS record disagrees on {', '.join(conflicts)}; it may be a different paper.", UNAVAILABLE_COLOR))
+        print("  1. Skip [default]")
+        print("  2. Paste manual replacement")
+        print("  3. Use ADS replacement (requires typed confirmation)")
+        answer = input(colorize("Select 1, 2, or 3 [1]: ", PROMPT_COLOR)).strip().lower()
+        if answer in {"", "1", "skip", "s", "n", "no"}:
+            return "skip"
+        if answer in {"2", "manual", "m", "paste", "p"}:
+            return "manual"
+        if answer in {"3", "ads"}:
+            confirm = input(colorize(f"Type 'replace' to overwrite {entry_key} with the ADS record: ", PROMPT_COLOR)).strip().lower()
+            if confirm == "replace":
+                return "ads"
+            print("Not confirmed; returning to the menu.")
+            continue
+        print("Please enter 1 to skip, 2 for a manual replacement, or 3 for the ADS record.")
+
+
+def print_identity_comparison(entry: BibEntry, ads_entry: BibEntry, conflicts: list[str]) -> None:
+    print(colorize(f"\n    Identity check: local and ADS disagree on {', '.join(conflicts)}", UNAVAILABLE_COLOR))
+    for field in ("author", "title", "year"):
+        print_detail(f"local {field}", entry.fields.get(field, "-"), label_width=12)
+        print_detail(f"ADS {field}", ads_entry.fields.get(field, "-"), label_width=12)
 
 
 def prompt_replacement_choice(entry_key: str, has_ads_replacement: bool) -> str:
@@ -1228,6 +1385,7 @@ def replace_outdated_entries(
         print_bibtex_block("Current BibTeX", current)
 
         ads_replacement: str | None = None
+        conflicts: list[str] = []
         if bibcode is not None:
             ads_bibtex = result.ads_bibtex
             if not ads_bibtex:
@@ -1241,9 +1399,15 @@ def replace_outdated_entries(
                 ads_replacement = replace_bibtex_key(ads_bibtex, current_entry.key)
                 print_detail("ADS bibcode", bibcode, indent="  ")
                 print_bibtex_block("ADS Replacement", ads_replacement)
+                ads_entry = parsed_ads_entry(current_entry, ads_bibtex)
+                if ads_entry is not None and (conflicts := identity_conflicts(current_entry, ads_entry)):
+                    print_identity_comparison(current_entry, ads_entry, conflicts)
         print("\n" + "-" * 100)
 
-        choice = prompt_replacement_choice(current_entry.key, ads_replacement is not None)
+        if ads_replacement is not None and conflicts:
+            choice = prompt_risky_replacement_choice(current_entry.key, conflicts)
+        else:
+            choice = prompt_replacement_choice(current_entry.key, ads_replacement is not None)
         if choice == "skip":
             print(f"Skipped {current_entry.key}.")
             continue
@@ -1296,6 +1460,82 @@ def replace_outdated_entries(
     return replacement_count
 
 
+def resolved_identity(entry: BibEntry, result: AdsResult) -> tuple[str, str] | None:
+    """A stable identity for duplicate grouping: the resolved bibcode, else the local DOI."""
+    if result.matches and (bibcode := str(result.matches[0].get("bibcode", ""))):
+        return ("bibcode", bibcode)
+    if doi := entry.fields.get("doi"):
+        return ("doi", normalized_identity_value(doi))
+    return None
+
+
+def duplicate_groups(results: list[tuple[BibEntry, AdsResult]]) -> list[tuple[tuple[str, str], list[BibEntry]]]:
+    groups: dict[tuple[str, str], list[BibEntry]] = {}
+    for entry, result in results:
+        if identity := resolved_identity(entry, result):
+            groups.setdefault(identity, []).append(entry)
+    return [(identity, entries) for identity, entries in groups.items() if len(entries) > 1]
+
+
+def print_duplicates(results: list[tuple[BibEntry, AdsResult]]) -> int:
+    duplicates = duplicate_groups(results)
+    print("\nDuplicates")
+    if not duplicates:
+        print("  None")
+        return 0
+    for (kind, value), entries in duplicates:
+        keys = ", ".join(f"{entry.key} (line {entry.line})" for entry in entries)
+        print(f"  {kind} {value}")
+        print_detail("Keys", keys)
+    return len(duplicates)
+
+
+def print_warnings(entries: list[BibEntry]) -> None:
+    malformed = [entry for entry in entries if malformed_author(entry)]
+    print("\nWarnings")
+    if not malformed:
+        print("  None")
+        return
+    for entry in malformed:
+        print(f"  {entry.key} (line {entry.line})")
+        print_detail("Issue", "author field contains a literal 'et al.', which renders as '(Smith & et al. 2020)'")
+        print_detail("Action", "replace it with the remaining author names, or with BibTeX's 'and others'")
+
+
+def cited_keys(text: str) -> set[str]:
+    text = TEX_COMMENT_RE.sub("", text)
+    keys: set[str] = set()
+    for match in CITE_RE.finditer(text):
+        keys.update(key.strip() for key in match.group("keys").split(",") if key.strip())
+    return keys
+
+
+def print_tex_crosscheck(entries: list[BibEntry], tex_paths: list[Path]) -> int:
+    cited: set[str] = set()
+    for path in tex_paths:
+        try:
+            cited |= cited_keys(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"Could not read {path}: {exc}", file=sys.stderr)
+            return 1
+
+    defined = {entry.key for entry in entries}
+    undefined = sorted(cited - defined - {"*"})
+    uncited = sorted(defined - cited)
+
+    print("\nTeX cross-check")
+    print_detail("Sources", ", ".join(str(path) for path in tex_paths))
+    if undefined:
+        print_detail("Undefined", f"{len(undefined)} key(s) cited in the .tex but absent from the .bib")
+        for key in undefined:
+            print(f"      - {key}")
+    if uncited:
+        print_detail("Uncited", f"{len(uncited)} entry(ies) defined in the .bib but never cited: {', '.join(uncited)}")
+    if not undefined and not uncited:
+        print("  Every cited key is defined and every entry is cited.")
+    return len(undefined)
+
+
 def print_report(results: list[tuple[BibEntry, AdsResult]], verbose: bool) -> int:
     counts: dict[str, int] = {}
     for _, result in results:
@@ -1318,6 +1558,9 @@ def print_report(results: list[tuple[BibEntry, AdsResult]], verbose: bool) -> in
         print("\nIssues")
         print("  None")
 
+    duplicate_count = print_duplicates(results)
+    print_warnings([entry for entry, _ in results])
+
     if verbose:
         ok_results = [(entry, result) for entry, result in results if result.status not in ISSUE_STATUSES]
         if ok_results:
@@ -1326,7 +1569,7 @@ def print_report(results: list[tuple[BibEntry, AdsResult]], verbose: bool) -> in
                 print_result(entry, result)
 
     failing = ISSUE_STATUSES
-    return 1 if any(result.status in failing for _, result in results) else 0
+    return 1 if duplicate_count or any(result.status in failing for _, result in results) else 0
 
 
 def progress_iter(
@@ -1430,6 +1673,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Interactively replace ADS_BIBTEX_MISMATCH/NON_ADS_BIBTEX entries.",
     )
+    parser.add_argument(
+        "--tex",
+        type=Path,
+        nargs="+",
+        default=[],
+        metavar="PATH",
+        help="Cross-check .tex sources for cited-but-undefined and defined-but-uncited keys.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Print every entry, not only problems.")
     return parser
 
@@ -1448,6 +1699,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not entries:
         print(f"No BibTeX entries found in {args.bibfile}", file=sys.stderr)
+        return 2
+    # Skipped entries stay visible to the TeX cross-check; they just are not sent to ADS.
+    all_entries = entries
+    entries = [entry for entry in all_entries if not entry.skip]
+    skipped_count = len(all_entries) - len(entries)
+    if not entries:
+        print(f"Every entry in {args.bibfile} is marked '% checkcitation: skip'.", file=sys.stderr)
         return 2
     if args.jobs < 1:
         print("--jobs must be at least 1.", file=sys.stderr)
@@ -1497,6 +1755,10 @@ def main(argv: list[str] | None = None) -> int:
         print("\nInterrupted; no further checks or replacements were attempted.", file=sys.stderr)
         return 130
     exit_code = print_report(results, args.verbose)
+    if skipped_count:
+        print(f"\n{skipped_count} entry(ies) not checked because of a '% checkcitation: skip' directive.")
+    if args.tex and print_tex_crosscheck(all_entries, args.tex):
+        exit_code = 1
     if args.replace and any(result.status == "ERROR" for _, result in results):
         print("\nReplacement skipped because ADS errors occurred during checking.")
         print("Rerun later, or use a gentler command such as: --jobs 1 --sleep 3")
