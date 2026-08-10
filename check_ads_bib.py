@@ -557,6 +557,10 @@ def urlopen_with_retries(request: urllib.request.Request, timeout: float) -> byt
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read()
+        except TimeoutError:
+            if attempt == DEFAULT_RETRIES:
+                raise
+            print(f"ADS request timed out; retrying ({attempt + 1}/{DEFAULT_RETRIES})", file=sys.stderr)
         except urllib.error.HTTPError as exc:
             if exc.code != 429:
                 raise
@@ -1759,10 +1763,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{skipped_count} entry(ies) not checked because of a '% checkcitation: skip' directive.")
     if args.tex and print_tex_crosscheck(all_entries, args.tex):
         exit_code = 1
-    if args.replace and any(result.status == "ERROR" for _, result in results):
-        print("\nReplacement skipped because ADS errors occurred during checking.")
-        print("Rerun later, or use a gentler command such as: --jobs 1 --sleep 3")
-    elif args.replace:
+    if args.replace:
         replace_outdated_entries(args.bibfile, results, args.token, args.timeout)
     return exit_code
 
