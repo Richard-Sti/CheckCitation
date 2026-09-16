@@ -445,6 +445,33 @@ function entry(over = {}) {
   console.log('ok: the All view filters, and offers Review only where it means something');
 }
 
+/* ---- a staged row offers the way out, not the way in ---- */
+{
+  const {nodes, call, set, read} = page();
+  set(`entries = ${JSON.stringify([
+    entry({key: 'A2020', line: 1}),
+    entry({key: 'B2019', line: 9, status: 'OK', issueish: false}),
+    entry({key: 'C2018', line: 20, status: 'OK', issueish: false, accepted: true}),
+  ])};
+  staged = {A2020: '@ARTICLE{A2020, title = {new}}', B2019: '@ARTICLE{B2019, title = {new}}'};
+  filter = 'all';`);
+  call('renderAll');
+  const [a, b, c] = nodes['all-rows'].rendered;
+  assert.match(a, /data-unstage="A2020"/, 'a staged issue offers Unstage, not Review');
+  assert.ok(!a.includes('data-review'), 'Review is no use when the point is to drop the edit');
+  // The trap this exists for: a re-check settles the entry to OK, so the row had
+  // no button at all - while the stage still blocked the all-or-nothing write.
+  assert.match(b, /data-unstage="B2019"/, 'a stage on a settled entry must still be reachable');
+  assert.match(c, /data-unaccept="C2018"/, 'an unstaged acceptance is untouched');
+
+  nodes['all-rows'].rendered = [];
+  set("filter = 'staged';");
+  call('renderAll');
+  assert.equal(nodes['all-rows'].rendered.length, 2, 'the staged filter shows exactly what is staged');
+  assert.deepEqual(read("entries.filter(e => matchesFilter(e, 'staged')).map(e => e.key)"), ['A2020', 'B2019']);
+  console.log('ok: a staged row offers Unstage, and the staged filter finds them all');
+}
+
 /* ---- concurrency: If-Match, 409, recovery ---- */
 (async () => {
   const sent = [];

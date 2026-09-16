@@ -109,10 +109,13 @@ and no other bibliography's decisions are affected.
   proposed BibTeX in an editable box. `->`/`l` replaces, `<-`/`h` keeps the local
   entry, `space` defers it to the back of the queue, `u` undoes the last replacement
   by writing the entry back exactly as it was.
-- **All** — every entry with its status and line, filterable to issues, entries that
-  agree with ADS, ones you have accepted, or skipped ones, sortable by key, line or
-  status. `Review` on any row sends it to the front of the card stack, and `↺ checked`
-  withdraws an acceptance.
+- **All** — every entry with its status and line, filterable to issues, staged edits,
+  entries that agree with ADS, ones you have accepted, or skipped ones, sortable by
+  key, line or status. `Review` on any row sends it to the front of the card stack,
+  `↺ checked` withdraws an acceptance, and a staged row offers `Unstage` instead of
+  `Review`, because dropping the edit is the thing you came for. **Re-check** never
+  discards a staged edit — it asks ADS again, it does not throw away your review —
+  so the `Staged` filter is how you find one that has gone stale and clear it.
 - **Cross-check** — duplicates, warnings, and, when `--tex` is given, the keys cited
   but undefined and the entries defined but never cited.
 

@@ -168,6 +168,7 @@ h3 { font-size:13.5px; margin:18px 0 6px }
     <div class="filters">
       <button data-filter="all" aria-pressed="true">All</button>
       <button data-filter="issues" aria-pressed="false">Issues</button>
+      <button data-filter="staged" aria-pressed="false">Staged</button>
       <button data-filter="ok" aria-pressed="false">Agrees with ADS</button>
       <button data-filter="accepted" aria-pressed="false">Checked and fine</button>
       <button data-filter="skip" aria-pressed="false">Skipped</button>
@@ -240,6 +241,7 @@ function sortRows(items, mode) {
 }
 
 function matchesFilter(entry, filter) {
+  if (filter === 'staged') return !!staged[entry.key];
   if (filter === 'accepted') return entry.accepted;
   if (filter === 'issues') return entry.issueish && !entry.accepted;
   if (filter === 'ok') return entry.status === 'OK';
@@ -675,7 +677,9 @@ function renderAll() {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><code>${esc(entry.key)}</code></td><td class="num">${entry.line}</td>` +
       `<td>${tag(entry.status)}</td><td>${esc(entry.local.title)}</td>` +
-      `<td>${entry.accepted
+      `<td>${staged[entry.key]
+        ? `<button class="btn" data-unstage="${esc(entry.key)}" title="Drop the staged edit, keeping it as a draft">Unstage</button>`
+        : entry.accepted
         ? `<button class="btn" data-unaccept="${esc(entry.key)}" title="Put it back in the queue">↺ checked</button>`
         : entry.issueish ? `<button class="btn" data-review="${esc(entry.key)}">Review</button>` : ''}</td>`;
     body.appendChild(tr);
