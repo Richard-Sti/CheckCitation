@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +16,7 @@ from check_ads_bib import (
     AdsResult,
     candidate_queries,
     check_entries_parallel,
+    check_entry,
     cited_keys,
     duplicate_groups,
     fetch_ads_once,
@@ -614,6 +616,109 @@ def test_a_collaboration_key_is_not_a_wrong_paper():
     # And a short key must not be waved through by a chance substring.
     short = entry("@ARTICLE{Li2020, author = {{Rafraf}, B.}, title = {A study of the lithium problem}, year = {2020}}")
     assert identity_conflicts(short, parsed_ads_entry(short, short.raw)) == ["key"]
+
+
+def test_a_surname_inside_a_title_word_is_not_a_collaboration_key():
+    """`ross` matches inside `cross-correlation`; whole words only."""
+    for key, author, title in (
+        ("Ross2017", "{Alam}, S.", "Cross-correlation of galaxies and CMB lensing"),
+        ("Ding2020", "{Zhao}, X.", "Understanding the halo mass function"),
+        ("King2019", "{Smith}, J.", "Making sense of quasar variability"),
+        ("Hall2021", "{Jones}, A.", "The challenge of shallow surveys"),
+    ):
+        local = entry("@ARTICLE{%s, author = {%s}, title = {%s}, year = {%s}}" % (key, author, title, key[-4:]))
+        assert identity_conflicts(local, parsed_ads_entry(local, local.raw)) == ["key"], key
+    # The real collaboration case still passes: the project is a word in the title.
+    ok = entry("@ARTICLE{CosmoVerse2025, author = {{Di Valentino}, E.}, title = {The CosmoVerse White Paper}, year = {2025}}")
+    assert identity_conflicts(ok, parsed_ads_entry(ok, ok.raw)) == []
+
+
+def test_a_tokenisation_difference_is_not_a_different_paper():
+    """`H\\,{\\sc i}` tokenises as `i`; ADS's `HI` tokenises as nothing."""
+    for left, right in (
+        ("The H\\,{\\sc i} mass function at z=0", "The HI mass function at z=0"),
+        ("3-D simulations of accretion", "3D simulations of accretion"),
+        ("2-D maps of the sky", "2D maps of the sky"),
+    ):
+        assert title_similarity(left, right) > 0.85, (left, right)
+        assert not titles_conflict(left, right), (series_tokens(left), series_tokens(right))
+    # Both sides numbered and disagreeing is still the case this exists for.
+    assert titles_conflict("The SAMI Survey, Paper I", "The SAMI Survey, Paper II")
+    assert titles_conflict("Gaia Data Release 2", "Gaia Data Release 3")
+
+
+def test_a_preprint_adsurl_still_offers_the_published_record():
+    """Citing the preprint of a now-published paper is what this tool is for."""
+    local = entry(
+        """@ARTICLE{Planck2020, author = {{Planck Collaboration}}, title = {Planck 2018 results},
+           year = {2020}, eprint = {1807.06209},
+           adsurl = {https://ui.adsabs.harvard.edu/abs/2018arXiv180706209P}}"""
+    )
+    doc = {"bibcode": "2020A&A...641A...6P", "title": ["Planck 2018 results"], "year": "2020",
+           "identifier": ["2018arXiv180706209P", "2020A&A...641A...6P", "arXiv:1807.06209"]}
+    export = "@ARTICLE{2020A&A...641A...6P, author = {{Planck Collaboration}}, title = {Planck 2018 results}, year = {2020}}"
+    check_ads_bib.reset_ads_run_cache()
+    check_ads_bib.ADS_CACHE = None
+    asked = []
+
+    def bulk(bibcodes, token, timeout):
+        asked.extend(bibcodes)
+        return {"2020A&A...641A...6P": export}
+
+    with patch.object(check_ads_bib, "ads_search", lambda *a, **k: [doc]), \
+         patch.object(check_ads_bib, "ads_export_bibtex_many", bulk):
+        result = check_entry(local, "token", 5, 5, 0)
+    assert result.status == "ADS_BIBTEX_MISMATCH", (result.status, result.message)
+    assert result.ads_bibtex, "no replacement was offered"
+    assert asked == ["2020A&A...641A...6P"], f"asked ADS for the alias, not the record: {asked}"
+
+
+def test_a_failing_reference_resolver_keeps_the_missing_verdict():
+    """It is a separate microservice; its being down must not rewrite the verdict."""
+    local = entry(
+        """@ARTICLE{Smith2020, author = {{Smith}, J.}, title = {T}, journal = {MNRAS},
+           volume = {1}, pages = {1}, year = {2020}, doi = {10.9999/typo}}"""
+    )
+    missing = AdsResult("MISSING", 'doi:"10.9999/typo"', [], "doi:0")
+
+    def boom(*args, **kwargs):
+        raise urllib.error.HTTPError("u", 500, "Server Error", {}, None)
+
+    check_ads_bib.reset_ads_run_cache()
+    with patch.object(check_ads_bib, "ads_search", lambda *a, **k: []), \
+         patch.object(check_ads_bib, "ads_resolve_reference", boom):
+        assert with_fallback(local, missing, "token", 5, 5, 0) is missing
+
+
+def test_an_unwritable_cache_does_not_kill_the_prefetch():
+    entries = parse_bibtex_text("@ARTICLE{A2020, adsurl = {https://ui.adsabs.harvard.edu/abs/2020ApJ...1....1A}}")
+
+    class Angry:
+        def get(self, *a): return None
+        def set_many(self, *a): raise PermissionError("read-only file system")
+
+    check_ads_bib.reset_ads_run_cache()
+    with patch.object(check_ads_bib, "ADS_CACHE", Angry()), \
+         patch.object(check_ads_bib, "ads_export_bibtex_many", lambda b, *a, **k: {b[0]: "@ARTICLE{%s, title = {T}}" % b[0]}):
+        prefetch_exports(entries, "token", 5)  # must not raise
+
+
+def test_every_cache_namespace_survives_a_reload():
+    """`reference` was written on every run and dropped on every load."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "c.json"
+        cache = check_ads_bib.AdsCache(path, ttl=check_ads_bib.DEFAULT_CACHE_TTL)
+        cache.set("reference", "Smith 2020, MNRAS, 1, 1", "2020MNRAS...1....1S")
+        cache.set("bibtex", "2020MNRAS...1....1S", "@ARTICLE{X}")
+        again = check_ads_bib.AdsCache(path, ttl=check_ads_bib.DEFAULT_CACHE_TTL)
+        assert again.get("reference", "Smith 2020, MNRAS, 1, 1") == "2020MNRAS...1....1S"
+        assert again.get("bibtex", "2020MNRAS...1....1S") == "@ARTICLE{X}"
+
+
+def test_an_arxiv_version_suffix_is_the_same_paper():
+    local = entry("@ARTICLE{Smith2020, title = {T}, year = {2020}, eprint = {1807.06209v2}}")
+    ads_side = parsed_ads_entry(local, "@ARTICLE{X, title = {T}, year = {2020}, eprint = {1807.06209}}")
+    assert identity_conflicts(local, ads_side) == []
 
 
 def main():

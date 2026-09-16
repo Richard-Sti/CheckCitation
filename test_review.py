@@ -498,6 +498,54 @@ def test_the_page_is_not_told_to_run_a_command_line_flag():
     assert review.gui_action("RATE_LIMITED") == check_ads_bib.ISSUE_ACTIONS["RATE_LIMITED"]
 
 
+def test_reloading_really_re_reads_the_file():
+    """"Reload from disk" used to hand back the previous parse with a fresh hash.
+
+    If-Match then passed while every offset was stale, so the write was refused
+    for ever and nothing but a full Re-check could escape.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        base, get, post, stop = serving(item)
+        try:
+            item.path.write_text("% an edit made in an editor\n" + BIB)
+            with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+                reloaded = get("/api/state")
+                assert reloaded["entries"][0]["line"] == 2, "the reload did not re-read the file"
+                payload = post("/api/replace", {"key": "Smith2020", "bibtex": ADS_EXPORT},
+                               revision=reloaded["revision"])
+            assert payload["replaced"] == 1, "the write was still refused after reloading"
+            assert item.path.read_text().startswith("% an edit made in an editor"), "the edit was clobbered"
+        finally:
+            stop()
+
+
+def test_a_replacement_may_not_rename_the_entry():
+    """`replace_bibtex_key` rewrites the first `@kind{key,`, which may be a @comment."""
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        before = item.path.read_bytes()
+        try:
+            item.replace("Smith2020", "@comment{note,}\n@ARTICLE{2020ApJ...900....1S, title = {T}}")
+        except ValueError as exc:
+            assert "would rename Smith2020" in str(exc), exc
+        else:
+            assert False, "the citation key was silently changed"
+        assert item.path.read_bytes() == before, "the file was touched anyway"
+
+
+def test_a_store_that_cannot_be_written_is_not_reported_as_saved():
+    """Telling someone a decision is recorded when it is not loses their work."""
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        item.store.parent.joinpath("blocked").mkdir()
+        item.store = item.store.parent / "blocked"  # a directory: the write must fail
+        item.accept("Smith2020")
+        assert item.accepted_error, "the failure was swallowed"
+        assert "not being recorded" in item.accepted_error
+        assert item.payload()["accepted_error"] == item.accepted_error, "the page has to be told"
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

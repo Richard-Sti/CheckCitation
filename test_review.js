@@ -276,11 +276,13 @@ function entry(over = {}) {
     },
   });
   const rows = [
-    entry({key: 'Safe2020', auto: true, raw: '@ARTICLE{Safe2020, title = {old}}'}),
+    // Vetted: the draft is the ADS export, untouched.
+    entry({key: 'Safe2020', auto: true, raw: '@ARTICLE{Safe2020, title = {old}}',
+           ads_bibtex: '@ARTICLE{Safe2020, title = {new}}'}),
     entry({key: 'Risky2019', auto: false, conflicts: ['title'], raw: '@ARTICLE{Risky2019, title = {old}}'}),
   ];
   set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; revision = 'r1'; busy = false;`);
-  set("deferred = []; focus = []; fetchedAuto = {}; history = []; confirming = null;");
+  set("deferred = []; focus = []; fetchedAuto = {}; vetted = {}; history = []; confirming = null; lastError = '';");
   set("drafts = {Safe2020: '@ARTICLE{Safe2020, title = {new}}', Risky2019: '@ARTICLE{Risky2019, title = {new}}'};");
 
   await read('saveAll()');
@@ -288,6 +290,40 @@ function entry(over = {}) {
   assert.deepEqual(read('focus'), ['Risky2019'], 'it goes to the front of the queue instead');
   assert.match(nodes.note.textContent, /confirm each on its card/);
   console.log('ok: Save writes the vetted edits and refuses to bulk-apply a risky one');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+
+/* ---- drafts belong to one bibliography, not to every "ref.bib" ---- */
+{
+  const stored = {};
+  const {read, call, set} = page({
+    localStorage: {getItem: k => stored[k] ?? null, setItem: (k, v) => { stored[k] = v; }},
+  });
+  set("source = 'ref.bib'; filePath = '/Users/me/PaperA/ref.bib';");
+  set("drafts = {Riess2022: 'A-only text'}; blockedDrafts = false; persistDrafts();");
+  assert.deepEqual(Object.keys(stored), ['ads-review-drafts:/Users/me/PaperA/ref.bib'],
+    'keying on the file name offers one paper\'s edit on another paper\'s entry');
+
+  set("filePath = '/Users/me/PaperB/ref.bib'; drafts = {};");
+  call('readDrafts');
+  assert.deepEqual(read('drafts'), {}, 'a different bibliography starts clean');
+  console.log('ok: drafts are scoped to the bibliography, not to its file name');
+}
+
+/* ---- a save that is refused says which entry and why ---- */
+(async () => {
+  const {nodes, read, set} = page({
+    fetch: async () => ({ok: false, status: 400, json: async () => ({error: 'replacement must be exactly one BibTeX entry'})}),
+  });
+  const rows = [entry({key: 'A2020', auto: true, raw: '@ARTICLE{A2020, title = {old}}',
+                       ads_bibtex: '@ARTICLE{A2020, title = {new}}'})];
+  set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; revision = 'r1'; busy = false;`);
+  set("deferred = []; focus = []; fetchedAuto = {}; vetted = {}; history = []; confirming = null; lastError = '';");
+  set("drafts = {A2020: '@ARTICLE{A2020, title = {new}}'};");
+  await read('saveAll()');
+  assert.match(nodes.note.textContent, /A2020 was refused/, 'the failing entry is named');
+  assert.match(nodes.note.textContent, /exactly one BibTeX entry/, 'and the reason survives');
+  assert.match(nodes.note.textContent, /0 saved before it/);
+  console.log('ok: a refused save reports which entry and why, not "Saved 0"');
 })().catch(e => { console.error(e); process.exitCode = 1; });
 
 /* ---- the handoff, for entries no route resolved ---- */
@@ -394,15 +430,20 @@ function entry(over = {}) {
     fetch: async () => { called += 1; return {ok: true, status: 200, json: async () => ({})}; },
   });
   set(`entries = ${JSON.stringify([entry({auto: false, status: 'ADS_RECORD_CONFLICT', conflicts: ['title']})])};`);
-  set('deferred = []; focus = []; drafts = {}; fetchedAuto = {}; busy = false;');
+  set('deferred = []; focus = []; drafts = {}; fetchedAuto = {}; vetted = {}; busy = false;');
   call('act', 'replace');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(called, 0, 'the replace key must not write a risky candidate');
   assert.match(nodes.note.textContent, /use the button/);
 
-  set('fetchedAuto = {Smith2020: true};');
+  set("fetchedAuto = {Smith2020: true}; vetted = {Smith2020: '@ARTICLE{Smith2020, title = {ads}}'}; drafts = {};");
   assert.match(read('cardBody(entries[0])'), /class="btn good"/,
     'once the server vets a fetched export it is one keypress again');
+
+  // ...but only for that exact text.
+  set("drafts = {Smith2020: '@ARTICLE{Smith2020, title = {something I pasted}}'};");
+  assert.match(read('cardBody(entries[0])'), /class="btn danger" data-apply/,
+    'text typed over a vetted proposal must go back to needing a confirmation');
   console.log('ok: the keyboard respects the server\'s risk verdict');
 })().catch(e => { console.error(e); process.exitCode = 1; });
 

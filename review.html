@@ -262,6 +262,16 @@ function currentEntry(entry) {
   return `<h3>Current entry, line ${entry.line}</h3><pre class="bib">${esc(entry.raw)}</pre>`;
 }
 
+// One keypress is only ever for text ADS itself produced and the server checked.
+// `entry.auto` describes `entry.ads_bibtex`; once something else is typed over it,
+// the card is back to needing a confirmation.
+function isVetted(entry, drafts, fetchedAuto, vetted) {
+  const clean = fetchedAuto[entry.key] ? (vetted[entry.key] || '') : (entry.auto ? entry.ads_bibtex || '' : '');
+  if (!clean.trim()) return false;
+  const draft = drafts[entry.key];
+  return draft === undefined || draft.trim() === clean.trim();
+}
+
 // Text you typed or fetched into a card but have not applied. Everything else is
 // already on disk: a replacement is written the moment it is accepted.
 function pendingKeys(entries, drafts) {
@@ -286,12 +296,16 @@ const $ = id => document.getElementById(id);
 
 let entries = [], counts = [], dupes = [], warns = [], tex = null;
 let revision = null, replaced = 0, skipped = 0, source = '';
-let deferred = [], focus = [], history = [], acceptedError = '';
-let drafts = {}, fetchedAuto = {}, blockedDrafts = false;
+let deferred = [], focus = [], history = [], acceptedError = '', lastError = '';
+let filePath = '';
+let drafts = {}, fetchedAuto = {}, vetted = {}, blockedDrafts = false;
 let busy = false, stale = false, filter = 'all', confirming = null;
 let requestQueue = Promise.resolve();
 
-function draftKey() { return 'ads-review-drafts:' + source; }
+// The absolute path, not the file name: every paper's bibliography is served
+// from the same origin, so keying on "ref.bib" offers one paper's unapplied edit
+// on another paper's entry of the same name - and applies it without confirming.
+function draftKey() { return 'ads-review-drafts:' + (filePath || source); }
 
 function readDrafts() {
   try {
@@ -348,6 +362,7 @@ function adopt(payload) {
   replaced = payload.replaced;
   skipped = payload.skipped;
   source = payload.source;
+  filePath = payload.path || '';
   acceptedError = payload.accepted_error || '';
   // Anything the server now calls settled cannot stay queued or deferred.
   const live = new Set(entries.filter(e => e.issueish).map(e => e.key));
@@ -407,9 +422,13 @@ async function replace(key, bibtex, undo = false) {
     // Only drop the draft once the server took it, and only if nothing was typed
     // in the meantime.
     if (drafts[key] === bibtex) { delete drafts[key]; persistDrafts(); }
+    // It has been acted on: leave focus, or the card comes straight back.
+    focus = focus.filter(k => k !== key);
+    lastError = '';
     note(res.body.notice || `${key} replaced.`);
     return true;
   } catch (e) {
+    lastError = e.message;
     note(e.message, true);
     return false;
   } finally {
@@ -425,12 +444,18 @@ async function saveAll() {
   // single card would demand; those are pushed to the front of the queue instead.
   const risky = keys.filter(key => {
     const entry = byKey(entries, key);
-    return !entry || !(entry.auto || fetchedAuto[key]);
+    return !entry || !isVetted(entry, drafts, fetchedAuto, vetted);
   });
   let saved = 0;
   for (const key of keys.filter(key => !risky.includes(key))) {
-    await replace(key, drafts[key]);
-    if (!drafts[key]) saved += 1;
+    if (!await replace(key, drafts[key])) {
+      // Stop at the first refusal and say which one, rather than reporting a
+      // cheerful "Saved 0" over the top of the reason.
+      note(`${key} was refused: ${lastError} (${saved} saved before it).`, true);
+      render();
+      return;
+    }
+    saved += 1;
   }
   if (risky.length) {
     focus = [...risky, ...focus.filter(key => !risky.includes(key))];
@@ -451,7 +476,7 @@ async function accept(key, accepted) {
     if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
     adopt(res.body);
     focus = focus.filter(k => k !== key);
-    note(res.body.notice || '');
+    note(acceptedError || res.body.notice || '', !!acceptedError);
   } catch (e) {
     note(e.message, true);
   } finally {
@@ -480,6 +505,7 @@ async function fetchExport(key, bibcode) {
     // The server vetted this export the same way a result that arrived with one
     // is vetted, so a clean one is still a one-keypress replacement.
     fetchedAuto[key] = !!res.body.auto;
+    vetted[key] = res.body.bibtex;
     persistDrafts();
     note(`ADS export for ${bibcode} loaded; review it before replacing.`);
   } catch (e) {
@@ -512,7 +538,7 @@ function stats() {
 
 function cardBody(entry) {
   const draft = drafts[entry.key] ?? entry.ads_bibtex ?? '';
-  const risky = !(entry.auto || fetchedAuto[entry.key]);
+  const risky = !isVetted(entry, drafts, fetchedAuto, vetted);
   const canFetch = !entry.ads_bibtex && entry.candidate && !drafts[entry.key];
   return `<div class="card">
     <h2>${esc(entry.key)}</h2>
@@ -613,7 +639,7 @@ function wire(container) {
   container.querySelectorAll('[data-apply]').forEach(el => el.onclick = () => {
     const key = el.dataset.apply;
     const entry = byKey(entries, key);
-    if (entry && !(entry.auto || fetchedAuto[key])) { confirming = key; render(); return; }
+    if (entry && !isVetted(entry, drafts, fetchedAuto, vetted)) { confirming = key; render(); return; }
     replace(key, currentDraft(key));
   });
   container.querySelectorAll('[data-confirm]').forEach(el =>
@@ -662,7 +688,7 @@ function act(what) {
     return;
   }
   if (what === 'replace') {
-    if (!entry || !(entry.auto || fetchedAuto[key])) {
+    if (!entry || !isVetted(entry, drafts, fetchedAuto, vetted)) {
       note('ADS disagrees with this entry, so it may be a different paper; use the button.', true);
       return;
     }
@@ -690,7 +716,7 @@ async function clearDecisions() {
     const res = await apiFetch('/api/clear', {method: 'POST', body: '{}'});
     if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
     adopt(res.body);
-    note(res.body.notice || '');
+    note(acceptedError || res.body.notice || '', !!acceptedError);
   } catch (e) {
     note(e.message, true);
   } finally {

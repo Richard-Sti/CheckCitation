@@ -94,6 +94,7 @@ RESOLVED_STATUSES = {
 }
 DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", re.I)
 ARXIV_PREFIX_RE = re.compile(r"^arxiv:", re.I)
+ARXIV_VERSION_RE = re.compile(r"v\d+$")
 STATUS_ORDER = (
     "OK",
     "ADS_BIBTEX_MISMATCH",
@@ -239,8 +240,12 @@ class AdsCache:
             print(f"Could not read ADS cache {self.path}: {exc}; starting with an empty cache.", file=sys.stderr)
             return
         if isinstance(raw, dict):
-            self.data["search"] = raw.get("search", {}) if isinstance(raw.get("search"), dict) else {}
-            self.data["bibtex"] = raw.get("bibtex", {}) if isinstance(raw.get("bibtex"), dict) else {}
+            # Every namespace, not a hard-coded two: `reference` was written on
+            # every run and dropped on every load, so the resolver was re-queried
+            # for each MISSING entry for ever.
+            for name, value in raw.items():
+                if name != "version" and isinstance(value, dict):
+                    self.data[name] = value
 
     def namespace(self, name: str) -> dict[str, object]:
         value = self.data.setdefault(name, {})
@@ -765,7 +770,12 @@ def ads_export_bibtex(bibcode: str, token: str, timeout: float) -> str:
     def fetch() -> object:
         if (wait := active_ads_rate_limit()) is not None:
             raise AdsRateLimitError(wait)
-        export = ads_export_bibtex_many([bibcode], token, timeout).get(bibcode, "")
+        exports = ads_export_bibtex_many([bibcode], token, timeout)
+        export = exports.get(bibcode, "")
+        if not export.strip() and len(exports) == 1:
+            # ADS keys each entry by its canonical bibcode, which is not
+            # necessarily the alias that was asked for.
+            export = next(iter(exports.values()))
         if not export.strip():
             raise RuntimeError(f"ADS returned no BibTeX export for {bibcode}")
         return export
@@ -907,7 +917,10 @@ def prefetch_exports(entries: list[BibEntry], token: str, timeout: float) -> Non
             print(f"Bulk ADS export failed ({exc}); falling back to one request per entry.", file=sys.stderr)
             return
         if ADS_CACHE is not None:
-            ADS_CACHE.set_many("bibtex", exports)
+            try:
+                ADS_CACHE.set_many("bibtex", exports)
+            except OSError as exc:
+                print(f"Could not write the ADS cache: {exc}", file=sys.stderr)
         with ADS_IN_FLIGHT_LOCK:
             for bibcode, text in exports.items():
                 ADS_RUN_CACHE[("bibtex", bibcode)] = text
@@ -951,7 +964,10 @@ def normalized_identifier(field: str, value: str) -> str:
     ordinary in the wild and name the same record as the bare form.
     """
     value = normalized_identity_value(value)
-    return (DOI_PREFIX_RE if field == "doi" else ARXIV_PREFIX_RE).sub("", value)
+    if field == "doi":
+        return DOI_PREFIX_RE.sub("", value)
+    # `1807.06209v2` is the same paper as `1807.06209`.
+    return ARXIV_VERSION_RE.sub("", ARXIV_PREFIX_RE.sub("", value))
 
 
 def series_tokens(title: str) -> list[str]:
@@ -968,9 +984,17 @@ def series_tokens(title: str) -> list[str]:
 
 def titles_conflict(local: str, ads: str) -> bool:
     """True when two titles should not be taken for the same paper."""
-    if not alphanumeric_key(local) or not alphanumeric_key(ads):
+    left_key, right_key = alphanumeric_key(local), alphanumeric_key(ads)
+    if not left_key or not right_key:
         return False
-    if series_tokens(local) != series_tokens(ads):
+    # The same title once markup and punctuation are gone, however each side
+    # happens to break into words: `H\\,{\\sc i}` against `HI`, `3-D` against `3D`.
+    if left_key == right_key:
+        return False
+    # Otherwise the numbering has to match, and only when both sides carry any:
+    # `Paper I` against `Paper II` is the case this exists for.
+    left, right = series_tokens(local), series_tokens(ads)
+    if left and right and left != right:
         return True
     return title_similarity(local, ads) < TITLE_SIMILARITY_THRESHOLD
 
@@ -1021,7 +1045,11 @@ def key_conflicts(key: str, ads_entry: BibEntry) -> bool:
         # citation key is deliberately kept.
         # ponytail: 4 characters, so a short surname like `Li` cannot be waved
         # through by a chance substring of some title.
-        if len(name) < 4 or name not in alphanumeric_key(ads_entry.fields.get("title", "")):
+        # Whole words only. On the concatenated title `ross` matches inside
+        # `cross-correlation`, which silently switched off the one check that
+        # catches an internally consistent entry naming the wrong paper.
+        title_words = set(WORD_RE.findall(normalized_identity_value(ads_entry.fields.get("title", ""))))
+        if len(name) < 4 or name not in title_words:
             return True
     ads_year = ads_entry.fields.get("year", "")
     # ponytail: +/-1 absorbs preprint-vs-journal year drift.
@@ -1241,7 +1269,13 @@ def resolve_by_fallback(
             return ("title and year", str(result.matches[0].get("bibcode", "")), result)
 
     if reference := reference_string(entry):
-        if bibcode := ads_resolve_reference(reference, token, timeout):
+        try:
+            bibcode = ads_resolve_reference(reference, token, timeout)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, RuntimeError, ValueError):
+            # A separate microservice. If it is down, keep the MISSING verdict and
+            # its handoff link rather than replacing both with ERROR.
+            bibcode = None
+        if bibcode:
             lookup = run_queries([("bibcode", f'bibcode:"{escape_query_value(bibcode)}"')], token, rows, timeout, sleep)
             matches = lookup.matches if lookup.status == "OK" else [{"bibcode": bibcode}]
             return ("the ADS reference resolver", bibcode, AdsResult("OK", reference, matches))
@@ -1289,7 +1323,12 @@ def check_entry_live(entry: BibEntry, token: str, rows: int, timeout: float, sle
 
     consensus = identifier_consensus(entry, token, rows, timeout, sleep)
     if consensus.status == "OK":
-        bibcode = local_bibcode or str(consensus.matches[0].get("bibcode", ""))
+        # The record's own bibcode, not the entry's: an adsurl often names the
+        # preprint alias of a record ADS has since merged, and only the canonical
+        # bibcode exports. Citing the preprint of a now-published paper is the
+        # case this tool exists for.
+        resolved = str(consensus.matches[0].get("bibcode", "")) if consensus.matches else ""
+        bibcode = resolved or local_bibcode
         return verify_ads_bibtex(entry, bibcode, consensus, token, timeout, local_bibcode=bool(local_bibcode))
     # Always arrive with something to look at: a partial resolve still gets its export.
     if consensus.status == "IDENTIFIER_MISMATCH" and (bibcode := ads_replacement_bibcode(consensus)):

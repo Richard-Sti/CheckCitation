@@ -104,10 +104,15 @@ class Review:
         else:
             files.pop(str(self.path), None)
         data["version"] = 1
-        self.store.parent.mkdir(parents=True, exist_ok=True)
-        if not self.store.exists():
-            self.store.touch()
-        ads.write_text_atomically(self.store, json.dumps(data, indent=1, sort_keys=True) + "\n")
+        try:
+            self.store.parent.mkdir(parents=True, exist_ok=True)
+            if not self.store.exists():
+                self.store.touch()
+            ads.write_text_atomically(self.store, json.dumps(data, indent=1, sort_keys=True) + "\n")
+        except OSError as exc:
+            # Never fail the request over this - the .bib write may already have
+            # happened - but the page must not report a decision that is not on disk.
+            self.accepted_error = f"Could not write {self.store.name} ({exc}); decisions are not being recorded."
 
     def is_accepted(self, entry):
         record = self.accepted.get(entry.key)
@@ -217,6 +222,14 @@ class Review:
         parsed = ads.parse_bibtex_text(replacement)
         if len(parsed) != 1:
             raise ValueError(f"replacement must be exactly one BibTeX entry, not {len(parsed)}")
+        # replace_bibtex_key rewrites the first `@kind{key,` it sees, which may be a
+        # `@comment{...}` wrapper that parsing then drops - leaving the real entry
+        # under the pasted key and every \cite{} to it broken.
+        if parsed[0].key != key:
+            raise ValueError(
+                f"the replacement would rename {key} to {parsed[0].key}; "
+                "remove any @comment or @string before the entry"
+            )
         text = self.path.read_text(encoding="utf-8")
         if text[entry.start : entry.end] != entry.raw:
             raise ValueError("the .bib changed on disk; reload before applying edits")
@@ -428,6 +441,12 @@ def handler_for(review):
                 return self._send(200, HTML.read_text(encoding="utf-8"), "text/html; charset=utf-8", no_store=True)
             if url.path == "/api/state":
                 with LOCK:
+                    # Re-parse, or "Reload from disk" hands back the previous parse
+                    # with a fresh revision: If-Match then passes while every entry
+                    # offset is stale, and the write is refused for ever. An entry
+                    # whose own text is unchanged keeps its verdict, so an edit
+                    # somewhere else in the file costs no ADS request.
+                    review.refresh()
                     return self._state()
             if url.path == "/api/bibtex":
                 query = parse_qs(url.query)
