@@ -211,12 +211,17 @@ month, because a published record does not change; a lookup that found nothing
 keeps for an hour, because it stops being nothing the moment ADS indexes the
 paper. `--cache-ttl` sets the first, `--refresh-cache` ignores both.
 
-Your own verdicts are kept too. **Checked, it is fine** on a card writes the entry
-to `<name>.checked.json` beside the `.bib`, and that entry is not raised again for
-a month — on this run, the next one, or after a restart. It is keyed to the entry's
-exact text, so editing it withdraws the acceptance and puts it back in the queue;
-`↺ checked` in the **All** view withdraws it by hand. The file is git-ignored, and
-a damaged one is reported and left alone rather than overwritten.
+Your own verdicts are kept too. **Checked, it is fine** on a card records the entry
+in `.checked.json`, and it is not raised again for a month — on this run, the next
+one, or after a restart. It is keyed to the entry's exact text, so editing the entry
+withdraws the acceptance and puts it back in the queue; `↺ checked` in the **All**
+view withdraws it by hand. A damaged store is reported and left alone rather than
+overwritten.
+
+That file lives **beside `check_ads_bib.py`, not beside your `.bib`**, with one
+section per bibliography keyed by absolute path. Reviewing a paper's `ref.bib` must
+not leave an untracked file in the paper's repository, and two `ref.bib` files in
+different directories never share a verdict.
 
 ## The ADS call budget
 

@@ -1,4 +1,4 @@
-# ADS responses, cached for a day. Yours, and regenerated on demand.
+# ADS responses, cached for a month. Yours, and regenerated on demand.
 .ads_cache.json
 
 # Backups the review app and --replace write beside a .bib.
@@ -6,7 +6,7 @@
 *.bib.bak[0-9]*
 
 # Which entries you have looked at and accepted. Yours, and about your .bib.
-*.checked.json
+.checked.json
 
 __pycache__/
 *.py[cod]

@@ -53,10 +53,11 @@ def canned(statuses):
     return stub
 
 
-def session(tmp, statuses, text=BIB, tex=()):
-    path = Path(tmp) / "ref.bib"
+def session(tmp, statuses, text=BIB, tex=(), name="ref.bib"):
+    path = Path(tmp) / name
     path.write_text(text)
-    item = review.Review(path, "token", tex=tex)
+    # The store lives with the tool, so tests must not touch the real one.
+    item = review.Review(path, "token", tex=tex, store=Path(tmp) / ".checked.json")
     with patch.object(check_ads_bib, "check_entries_parallel", canned(statuses)):
         item.refresh()
     return item
@@ -327,7 +328,9 @@ def test_accepting_an_entry_outlives_the_tab():
             stop()
         smith = {e["key"]: e for e in payload["entries"]}["Smith2020"]
         assert smith["accepted"] is True and smith["issueish"] is True, "still an issue, just not an open one"
-        assert review.accepted_path(item.path).exists()
+        assert item.store.exists() and not (item.path.parent / "ref.checked.json").exists(), \
+            "nothing may be written beside the .bib; that is someone else's repository"
+        assert str(item.path) in json.loads(item.store.read_text())["files"], "keyed by the .bib's own path"
 
         # A fresh session on the same file, as if the tool were re-run tomorrow.
         again = session(tmp, MISMATCH)
@@ -352,7 +355,7 @@ def test_an_acceptance_can_be_withdrawn():
         item.accept("Smith2020")
         item.accept("Smith2020", accepted=False)
         assert not item.is_accepted(item.entries[0])
-        assert json.loads(review.accepted_path(item.path).read_text())["accepted"] == {}
+        assert json.loads(item.store.read_text())["files"] == {}
 
 
 def test_an_acceptance_expires():
@@ -366,7 +369,7 @@ def test_an_acceptance_expires():
 def test_a_damaged_checked_file_is_reported_not_overwritten():
     with tempfile.TemporaryDirectory() as tmp:
         item = session(tmp, MISMATCH)
-        path = review.accepted_path(item.path)
+        path = item.store
         path.write_text("{not json")
         again = session(tmp, MISMATCH)
         assert again.accepted_error and "checked.json" in again.accepted_error
@@ -389,6 +392,38 @@ def test_accepting_an_unknown_key_is_refused():
                     assert False, f"accepted {body}"
         finally:
             stop()
+
+
+def test_two_bibliographies_never_share_acceptances():
+    """Same stem, different directory, different paper - and one store for both."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp) / ".checked.json"
+        one, two = Path(tmp) / "a", Path(tmp) / "b"
+        sessions = []
+        for folder in (one, two):
+            folder.mkdir()
+            path = folder / "ref.bib"
+            path.write_text(BIB)
+            item = review.Review(path, "token", store=store)
+            with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+                item.refresh()
+            sessions.append(item)
+
+        sessions[0].accept("Smith2020")
+        assert sessions[0].is_accepted(sessions[0].entries[0])
+
+        reopened = review.Review(two / "ref.bib", "token", store=store)
+        with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+            reopened.refresh()
+        assert not reopened.is_accepted(reopened.entries[0]), "the other paper's decision leaked"
+
+        # And saving the second must not drop the first.
+        sessions[1].accept("Jones2019")
+        files = json.loads(store.read_text())["files"]
+        first, second = str((one / "ref.bib").resolve()), str((two / "ref.bib").resolve())
+        assert set(files) == {first, second}, files
+        assert list(files[first]) == ["Smith2020"], "saving the second dropped the first"
+        assert list(files[second]) == ["Jones2019"]
 
 
 def main():

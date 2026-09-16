@@ -31,9 +31,10 @@ ADS_FIELDS = ("title", "author", "year", "doi", "eprint")
 ACCEPTED_TTL = ads.DEFAULT_CACHE_TTL
 
 
-def accepted_path(path):
-    """Beside the .bib, like its backup: the pair travels together."""
-    return path.with_name(path.stem + ".checked.json")
+# One store for every .bib, in the tool's own directory rather than beside each
+# file: reviewing a paper's ref.bib must not leave an untracked file in the paper's
+# repository. Entries are keyed by absolute path, so two ref.bib files never mix.
+CHECKED_PATH = Path(__file__).resolve().parent / ".checked.json"
 
 
 def fingerprint(entry):
@@ -49,8 +50,9 @@ class Review:
     nothing once the tab is closed.
     """
 
-    def __init__(self, path, token, rows=5, timeout=20.0, sleep=ads.DEFAULT_SLEEP, jobs=1, tex=()):
+    def __init__(self, path, token, rows=5, timeout=20.0, sleep=ads.DEFAULT_SLEEP, jobs=1, tex=(), store=CHECKED_PATH):
         self.path = Path(path).resolve()
+        self.store = Path(store)
         self.token = token
         self.rows = rows
         self.timeout = timeout
@@ -69,25 +71,43 @@ class Review:
         A damaged file is reported and then left alone: overwriting it is the one
         way to lose the judgements it holds.
         """
-        path = accepted_path(self.path)
+        data, error = self._read_store()
+        if error:
+            return {}, error
+        accepted = data.get("files", {}).get(str(self.path))
+        return accepted if isinstance(accepted, dict) else {}, ""
+
+    def _read_store(self):
+        """The whole store, or why it could not be read."""
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(self.store.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return {}, ""
+            return {"version": 1, "files": {}}, ""
         except (OSError, ValueError) as exc:
-            return {}, f"Could not read {path.name} ({exc}); accepted entries are not being recorded."
-        accepted = data.get("accepted") if isinstance(data, dict) else None
-        if not isinstance(accepted, dict):
-            return {}, f"{path.name} is not in the expected shape; accepted entries are not being recorded."
-        return accepted, ""
+            return {}, f"Could not read {self.store.name} ({exc}); accepted entries are not being recorded."
+        if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+            return {}, f"{self.store.name} is not in the expected shape; accepted entries are not being recorded."
+        return data, ""
 
     def _save_accepted(self):
+        """Rewrite this file's slice of the store, leaving every other file's alone."""
         if self.accepted_error:
             return
-        ads.write_text_atomically(
-            accepted_path(self.path),
-            json.dumps({"version": 1, "accepted": self.accepted}, indent=1, sort_keys=True) + "\n",
-        )
+        data, error = self._read_store()
+        if error:
+            # Something damaged the store since startup; never overwrite it.
+            self.accepted_error = error
+            return
+        files = data.setdefault("files", {})
+        if self.accepted:
+            files[str(self.path)] = self.accepted
+        else:
+            files.pop(str(self.path), None)
+        data["version"] = 1
+        self.store.parent.mkdir(parents=True, exist_ok=True)
+        if not self.store.exists():
+            self.store.touch()
+        ads.write_text_atomically(self.store, json.dumps(data, indent=1, sort_keys=True) + "\n")
 
     def is_accepted(self, entry):
         record = self.accepted.get(entry.key)
