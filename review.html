@@ -119,7 +119,7 @@ h3 { font-size:13.5px; margin:18px 0 6px }
   <h1>ADS citation review</h1>
   <span id="source"></span>
   <span class="spacer"></span>
-  <button class="btn good" id="btn-save" hidden>Save</button>
+  <button class="btn good" id="btn-write" hidden>Write</button>
   <button class="btn" id="btn-recheck">Re-check</button>
   <button class="btn" id="btn-clear" hidden>Clear decisions</button>
   <button class="btn" id="btn-reload" hidden>Reload from disk</button>
@@ -139,6 +139,12 @@ h3 { font-size:13.5px; margin:18px 0 6px }
     <button class="stat" data-stat="accepted"><b id="s-accepted">0</b><span>Checked and fine</span></button>
     <button class="stat" data-stat="replaced"><b id="s-replaced">0</b><span>Replaced</span></button>
     <button class="stat" data-stat="skip"><b id="s-skipped">0</b><span>Not checked</span></button>
+  </div>
+
+  <div class="confirm" id="write-confirm" hidden>
+    <span id="write-summary"></span>
+    <button class="btn danger" id="btn-write-yes">Yes, write them</button>
+    <button class="btn" id="btn-write-no">Cancel</button>
   </div>
 
   <div class="confirm" id="clear-confirm" hidden>
@@ -203,12 +209,20 @@ const tag = status => `<span class="tag t-${tone(status)}">${esc(label(status))}
 
 const byKey = (entries, key) => entries.find(e => e.key === key) || null;
 
+// Staged edits for entries that still exist and would actually change something.
+function stagedKeys(staged, entries) {
+  return Object.keys(staged).filter(key => {
+    const entry = entries.find(e => e.key === key);
+    return !!entry && !!(staged[key] || '').trim() && staged[key].trim() !== entry.raw.trim();
+  });
+}
+
 // The queue is derived, never stored: an entry leaves it because ADS now agrees,
 // or because you accepted it - and that acceptance lives beside the .bib, so it
 // survives the tab, the restart and the next run.
-function queueKeys(entries, deferred, focus) {
+function queueKeys(entries, deferred, focus, staged = {}) {
   const open = entries
-    .filter(e => e.issueish && (!e.accepted || focus.includes(e.key)))
+    .filter(e => e.issueish && !staged[e.key] && (!e.accepted || focus.includes(e.key)))
     .map(e => e.key);
   const rank = key => focus.includes(key) ? 0 : deferred.includes(key) ? 2 : 1;
   return open.slice().sort((a, b) => rank(a) - rank(b));
@@ -297,9 +311,9 @@ const $ = id => document.getElementById(id);
 
 let entries = [], counts = [], dupes = [], warns = [], tex = null;
 let revision = null, replaced = 0, skipped = 0, source = '';
-let deferred = [], focus = [], history = [], acceptedError = '', lastError = '';
+let deferred = [], focus = [], history = [], acceptedError = '';
 let filePath = '';
-let drafts = {}, fetchedAuto = {}, vetted = {}, blockedDrafts = false;
+let drafts = {}, staged = {}, fetchedAuto = {}, vetted = {}, blockedDrafts = false;
 let busy = false, stale = false, filter = 'all', confirming = null;
 let requestQueue = Promise.resolve();
 
@@ -307,24 +321,31 @@ let requestQueue = Promise.resolve();
 // from the same origin, so keying on "ref.bib" offers one paper's unapplied edit
 // on another paper's entry of the same name - and applies it without confirming.
 function draftKey() { return 'ads-review-drafts:' + (filePath || source); }
+function stagedKey() { return 'ads-review-staged:' + (filePath || source); }
 
 function readDrafts() {
   try {
     drafts = JSON.parse(localStorage.getItem(draftKey()) || '{}') || {};
     if (typeof drafts !== 'object') drafts = {};
+    staged = JSON.parse(localStorage.getItem(stagedKey()) || '{}') || {};
+    if (typeof staged !== 'object') staged = {};
   } catch (e) {
     // Damaged storage is left exactly as it is; overwriting it is the one way
     // to lose a pasted replacement for good.
-    drafts = {}; blockedDrafts = true;
+    drafts = {}; staged = {}; blockedDrafts = true;
   }
 }
 
 function persistDrafts() {
   if (blockedDrafts) return;
-  try { localStorage.setItem(draftKey(), JSON.stringify(drafts)); } catch (e) { blockedDrafts = true; }
+  try {
+    localStorage.setItem(draftKey(), JSON.stringify(drafts));
+    // Staged edits outlive the tab too, so closing it cannot lose a review.
+    localStorage.setItem(stagedKey(), JSON.stringify(staged));
+  } catch (e) { blockedDrafts = true; }
 }
 
-function hasDrafts() { return Object.values(drafts).some(v => v && v.trim()); }
+function hasDrafts() { return Object.values(drafts).some(v => v && v.trim()) || stagedKeys(staged, entries).length > 0; }
 
 function note(text, isError) {
   const el = $('note');
@@ -425,11 +446,9 @@ async function replace(key, bibtex, undo = false) {
     if (drafts[key] === bibtex) { delete drafts[key]; persistDrafts(); }
     // It has been acted on: leave focus, or the card comes straight back.
     focus = focus.filter(k => k !== key);
-    lastError = '';
     note(res.body.notice || `${key} replaced.`);
     return true;
   } catch (e) {
-    lastError = e.message;
     note(e.message, true);
     return false;
   } finally {
@@ -438,34 +457,46 @@ async function replace(key, bibtex, undo = false) {
   }
 }
 
-async function saveAll() {
-  const keys = pendingKeys(entries, drafts);
-  if (!keys.length || busy) return;
-  // A bulk save must not slip a possible different paper past the confirmation a
-  // single card would demand; those are pushed to the front of the queue instead.
-  const risky = keys.filter(key => {
-    const entry = byKey(entries, key);
-    return !entry || !isVetted(entry, drafts, fetchedAuto, vetted);
-  });
-  let saved = 0;
-  for (const key of keys.filter(key => !risky.includes(key))) {
-    if (!await replace(key, drafts[key])) {
-      // Stop at the first refusal and say which one, rather than reporting a
-      // cheerful "Saved 0" over the top of the reason.
-      note(`${key} was refused: ${lastError} (${saved} saved before it).`, true);
-      render();
-      return;
-    }
-    saved += 1;
-  }
-  if (risky.length) {
-    focus = [...risky, ...focus.filter(key => !risky.includes(key))];
-    tab('review');
-    note(`Saved ${saved} to ${source}. ${risky.length} may be a different paper; confirm each on its card.`, true);
-  } else {
-    note(`Saved ${saved} edit${saved === 1 ? '' : 's'} to ${source}.`);
-  }
+// Staging is a decision, not a write: nothing touches the .bib until Write.
+function stage(key, bibtex) {
+  if (!bibtex || !bibtex.trim()) return;
+  staged[key] = bibtex;
+  delete drafts[key];
+  focus = focus.filter(k => k !== key);
+  confirming = null;
+  persistDrafts();
+  note(`${key} staged. Nothing is written until you click Write.`);
   render();
+}
+
+function unstage(key) {
+  delete staged[key];
+  persistDrafts();
+  note(`${key} unstaged.`);
+  render();
+}
+
+async function writeAll() {
+  const keys = stagedKeys(staged, entries);
+  if (!keys.length || busy) return;
+  busy = true;
+  note(`Writing ${keys.length} change${keys.length === 1 ? '' : 's'} to ${source}…`);
+  try {
+    const edits = {};
+    keys.forEach(key => { edits[key] = staged[key]; });
+    const res = await apiFetch('/api/commit', {method: 'POST', body: JSON.stringify({edits})});
+    if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
+    // Only once the server has them: a refused write keeps every staged edit.
+    keys.forEach(key => { history.unshift({key, raw: byKey(entries, key).raw}); delete staged[key]; });
+    persistDrafts();
+    adopt(res.body);
+    note(acceptedError || res.body.notice || '', !!acceptedError);
+  } catch (e) {
+    note(e.message, true);
+  } finally {
+    busy = false;
+    render();
+  }
 }
 
 async function accept(key, accepted) {
@@ -528,11 +559,17 @@ function stats() {
   if (!decided) $('clear-confirm').hidden = true;
   $('s-replaced').textContent = replaced;
   $('s-skipped').textContent = skipped;
-  const pending = pendingKeys(entries, drafts).length;
-  $('source').textContent = pending ? `${source} · ${pending} unsaved` : `${source} · saved`;
-  $('btn-save').hidden = pending === 0;
-  $('btn-save').textContent = `Save ${pending} edit${pending === 1 ? '' : 's'} to ${source}`;
-  $('n-review').textContent = queueKeys(entries, deferred, focus).length || '';
+  const unapplied = pendingKeys(entries, drafts).length;
+  const waiting = stagedKeys(staged, entries).length;
+  $('source').textContent = waiting
+    ? `${source} · ${waiting} staged, not written`
+    : unapplied ? `${source} · ${unapplied} unapplied` : `${source} · saved`;
+  $('btn-write').hidden = waiting === 0;
+  $('btn-write').textContent = `Write ${waiting} change${waiting === 1 ? '' : 's'} to ${source}`;
+  $('write-summary').textContent =
+    `Write ${waiting} change${waiting === 1 ? '' : 's'} to ${source}? One backup is kept, and nothing else is touched.`;
+  if (!waiting) $('write-confirm').hidden = true;
+  $('n-review').textContent = queueKeys(entries, deferred, focus, staged).length || '';
   $('n-all').textContent = entries.length || '';
   $('n-check').textContent = (dupes.length + warns.length + (tex ? tex.undefined.length : 0)) || '';
 }
@@ -566,7 +603,7 @@ function cardBody(entry) {
     <div class="actions">
       <button class="btn ${risky ? 'danger' : 'good'}" data-apply="${esc(entry.key)}"
         ${draft.trim() && !(entry.identical && draft.trim() === (entry.ads_bibtex || '').trim()) ? '' : 'disabled'}>
-        ${risky ? 'Replace anyway…' : 'Replace'}</button>
+        ${risky ? 'Stage it anyway…' : 'Stage replacement'}</button>
       <button class="btn" data-keep="${esc(entry.key)}">Checked, it is fine</button>
       <button class="btn" data-defer="${esc(entry.key)}">Defer</button>
       ${history.length ? `<button class="btn" data-undo="0">Undo ${esc(history[0].key)}</button>` : ''}
@@ -576,19 +613,23 @@ function cardBody(entry) {
       <button class="btn danger" data-confirm="${esc(entry.key)}">Yes, replace</button>
       <button class="btn" data-cancel="1">Cancel</button></div>` : ''}
     <p class="keys">${risky
-      ? '← / h checked and fine · space defer · u undo. A risky replacement needs the button.'
-      : '→ / l replace · ← / h checked and fine · space defer · u undo'}</p>
+      ? '← / h checked and fine · space defer. A risky replacement needs the button. Nothing is written until you click Write.'
+      : '→ / l stage · ← / h checked and fine · space defer. Nothing is written until you click Write.'}</p>
   </div>`;
 }
 
 function renderCard() {
-  const queue = queueKeys(entries, deferred, focus);
+  const queue = queueKeys(entries, deferred, focus, staged);
   const entry = queue.length ? byKey(entries, queue[0]) : null;
   $('card').innerHTML = entry ? cardBody(entry) : '';
   $('review-empty').hidden = !!entry;
-  $('recent-head').hidden = history.length === 0;
-  $('recent-rows').innerHTML = history.map((item, i) =>
-    `<li><code>${esc(item.key)}</code> <button class="btn" data-undo="${i}">Undo</button></li>`).join('');
+  const pending = stagedKeys(staged, entries);
+  $('recent-head').hidden = history.length === 0 && pending.length === 0;
+  $('recent-head').textContent = pending.length ? 'Staged, not yet written' : 'Written this session';
+  $('recent-rows').innerHTML =
+    pending.map(key => `<li><code>${esc(key)}</code> <button class="btn" data-unstage="${esc(key)}">Unstage</button></li>`).join('') +
+    history.map((item, i) =>
+      `<li><code>${esc(item.key)}</code> written <button class="btn" data-undo="${i}">Undo</button></li>`).join('');
   wire($('card'));
   wire($('recent-rows'));
 }
@@ -649,10 +690,11 @@ function wire(container) {
     const key = el.dataset.apply;
     const entry = byKey(entries, key);
     if (entry && !isVetted(entry, drafts, fetchedAuto, vetted)) { confirming = key; render(); return; }
-    replace(key, currentDraft(key));
+    stage(key, currentDraft(key));
   });
   container.querySelectorAll('[data-confirm]').forEach(el =>
-    el.onclick = () => replace(el.dataset.confirm, currentDraft(el.dataset.confirm)));
+    el.onclick = () => stage(el.dataset.confirm, currentDraft(el.dataset.confirm)));
+  container.querySelectorAll('[data-unstage]').forEach(el => el.onclick = () => unstage(el.dataset.unstage));
   container.querySelectorAll('[data-cancel]').forEach(el =>
     el.onclick = () => { confirming = null; render(); });
   container.querySelectorAll('[data-keep]').forEach(el =>
@@ -688,7 +730,7 @@ function currentDraft(key) {
 }
 
 function act(what) {
-  const queue = queueKeys(entries, deferred, focus);
+  const queue = queueKeys(entries, deferred, focus, staged);
   if (!queue.length || busy) return;
   const key = queue[0];
   const entry = byKey(entries, key);
@@ -701,7 +743,7 @@ function act(what) {
       note('ADS disagrees with this entry, so it may be a different paper; use the button.', true);
       return;
     }
-    replace(key, currentDraft(key));
+    stage(key, currentDraft(key));
     return;
   }
   focus = focus.filter(k => k !== key);
@@ -758,7 +800,9 @@ document.querySelectorAll('[data-stat]').forEach(el => el.onclick = () => {
   tab('all');
 });
 
-$('btn-save').onclick = e => { e.currentTarget.blur(); saveAll(); };
+$('btn-write').onclick = e => { e.currentTarget.blur(); $('write-confirm').hidden = false; };
+$('btn-write-no').onclick = () => { $('write-confirm').hidden = true; };
+$('btn-write-yes').onclick = e => { e.currentTarget.blur(); $('write-confirm').hidden = true; writeAll(); };
 $('btn-clear').onclick = e => { e.currentTarget.blur(); $('clear-confirm').hidden = false; };
 $('btn-clear-no').onclick = () => { $('clear-confirm').hidden = true; };
 $('btn-clear-yes').onclick = e => {

@@ -569,6 +569,70 @@ def test_an_entry_that_already_is_the_ads_export_offers_no_replacement():
         assert other["identical"] is False
 
 
+def test_a_commit_writes_every_staged_edit_in_one_pass():
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        jones = ADS_EXPORT.replace("2020ApJ...900....1S", "2019ApJ...800....2J").replace(
+            "A study of galaxies", "Another study")
+        base, get, post, stop = serving(item)
+        try:
+            with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+                payload = post("/api/commit", {"edits": {"Smith2020": ADS_EXPORT, "Jones2019": jones}})
+        finally:
+            stop()
+        text = item.path.read_text()
+        assert "@ARTICLE{Smith2020," in text and "@ARTICLE{Jones2019," in text, "keys must survive"
+        assert "2020ApJ...900....1S," not in text and "2019ApJ...800....2J," not in text
+        assert payload["replaced"] == 2
+        assert "Wrote 2 changes" in payload["notice"], payload["notice"]
+        backups = sorted(q.name for q in item.path.parent.glob("ref.bib.bak*"))
+        assert backups == ["ref.bib.bak"], f"one write, one backup, not {backups}"
+
+
+def test_one_bad_edit_writes_none_of_them():
+    """The file must never be left holding half a review."""
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        before = item.path.read_bytes()
+        base, get, post, stop = serving(item)
+        try:
+            for edits in (
+                {"Smith2020": ADS_EXPORT, "Nope2020": ADS_EXPORT},                       # unknown key
+                {"Smith2020": ADS_EXPORT, "Jones2019": ADS_EXPORT + ADS_EXPORT},         # two entries
+                {"Smith2020": "@comment{note,}\n@ARTICLE{2020ApJ...900....1S, title = {T}}"},  # renames
+                {},                                                                       # nothing staged
+            ):
+                try:
+                    post("/api/commit", {"edits": edits})
+                except HTTPError as exc:
+                    assert exc.code == 400, (edits, exc.code)
+                else:
+                    assert False, f"accepted {list(edits)}"
+                assert item.path.read_bytes() == before, "a rejected commit touched the file"
+            assert not list(item.path.parent.glob("ref.bib.bak*")), "a rejected commit left a backup"
+        finally:
+            stop()
+
+
+def test_a_stale_tab_cannot_commit():
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        base, get, post, stop = serving(item)
+        try:
+            stale = get("/api/state")["revision"]
+            item.path.write_text(BIB.replace("Another study", "Another study, revised"))
+            before = item.path.read_bytes()
+            try:
+                post("/api/commit", {"edits": {"Smith2020": ADS_EXPORT}}, revision=stale)
+            except HTTPError as exc:
+                assert exc.code == 409, exc.code
+            else:
+                assert False, "a stale tab committed"
+            assert item.path.read_bytes() == before
+        finally:
+            stop()
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

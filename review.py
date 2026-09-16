@@ -208,6 +208,57 @@ class Review:
             raise ValueError(f"{len(matches)} entries share the key {key}; remove the duplicate first")
         return matches[0]
 
+    def _prepare(self, text, key, bibtex):
+        """Validate one edit against `text`, returning (entry, replacement)."""
+        entry = self.entry_for(key)
+        if entry is None:
+            raise KeyError(f"no entry with key {key}")
+        replacement = ads.replace_bibtex_key(str(bibtex).strip(), key)
+        parsed = ads.parse_bibtex_text(replacement)
+        if len(parsed) != 1:
+            raise ValueError(f"{key}: a replacement must be exactly one BibTeX entry, not {len(parsed)}")
+        # replace_bibtex_key rewrites the first `@kind{key,` it sees, which may be a
+        # `@comment{...}` wrapper that parsing then drops - leaving the real entry
+        # under the pasted key and every cite to it broken.
+        if parsed[0].key != key:
+            raise ValueError(
+                f"{key}: the replacement would rename it to {parsed[0].key}; "
+                "remove any @comment or @string before the entry"
+            )
+        if text[entry.start : entry.end] != entry.raw:
+            raise ValueError("the .bib changed on disk; reload before writing")
+        return entry, replacement
+
+    def commit(self, edits):
+        """Write every staged edit in one backup and one atomic write.
+
+        All or nothing: one bad edit writes none of them, so the file is never left
+        holding half a review.
+        """
+        if not isinstance(edits, dict) or not edits:
+            raise ValueError("there is nothing staged to write")
+        text = self.path.read_text(encoding="utf-8")
+        pending = [self._prepare(text, key, bibtex) for key, bibtex in edits.items()]
+        self.backup = ads.ensure_backup(self.path, self.backup)
+        ads.write_text_atomically(self.path, ads.apply_replacements(text, pending))
+        self.replaced += len(pending)
+        self.refresh(recheck=set(edits))
+        # Acting on an entry settles it: if ADS still disagrees after the rewrite it
+        # must not go back to the top of the queue, because some conflicts no
+        # rewrite can clear.
+        settled = [
+            key for key in edits
+            if any(e.key == key and r.status in ads.ISSUE_STATUSES for e, r in self.results)
+        ]
+        for key in settled:
+            self.accept(key)
+        written = f"Wrote {len(pending)} change{'' if len(pending) == 1 else 's'} to {self.path.name}"
+        tail = f"; backup at {self.backup.name}"
+        if settled:
+            tail += f". {len(settled)} still differ{'s' if len(settled) == 1 else ''} from ADS and " \
+                    f"{'is' if len(settled) == 1 else 'are'} marked checked rather than re-queued"
+        return written + tail + "."
+
     def replace(self, key, bibtex, settle=True):
         """Write one reviewed replacement into the .bib, keeping the citation key.
 
@@ -473,7 +524,7 @@ def handler_for(review):
 
         def _post(self):
             url = urlsplit(self.path)
-            if url.path not in {"/api/replace", "/api/recheck", "/api/accept", "/api/clear"}:
+            if url.path not in {"/api/replace", "/api/recheck", "/api/accept", "/api/clear", "/api/commit"}:
                 return self._send(404, "not found", "text/plain")
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
                 return self._error(400, "expected Content-Type: application/json")
@@ -497,6 +548,9 @@ def handler_for(review):
 
             if self.headers.get("If-Match") != review.revision():
                 return self._error(409, "The .bib changed since this tab loaded it. Reload, then retry the edit.")
+
+            if url.path == "/api/commit":
+                return self._state(review.commit(body.get("edits")))
 
             if url.path == "/api/clear":
                 return self._state(review.clear_accepted())

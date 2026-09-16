@@ -121,18 +121,21 @@ every ADS record linked to its abstract page. A card that resolved nowhere says 
 and offers the ADS search to run instead, because at that point the tool has done
 what it can and finding the record is yours.
 
-Acting on an entry settles it: if ADS still disagrees after a replacement, the
-entry is marked checked rather than put straight back at the top of the queue.
+Acting on an entry settles it: if ADS still disagrees after the write, the entry is
+marked checked rather than put straight back at the top of the queue.
 Some conflicts no rewrite can clear — a citation key is kept by design, so a key
 the record disagrees with would otherwise be raised for ever.
 
-**Replacements are written as you accept them** — there is no separate save step
-for those. The header says so: `ref.bib · saved`. What is *not* on disk is BibTeX
-you typed or fetched into a card and have not applied; that lives in the browser
-until you act on it, so the header switches to `ref.bib · 3 unsaved` and a **Save
-3 edits to ref.bib** button appears. It writes the vetted ones and pushes anything
-that might be a different paper to the front of the queue instead of slipping it
-past the confirmation a single card would demand.
+**Nothing touches your `.bib` until you say so.** Working through the cards stages
+decisions; the header counts them (`ref.bib · 6 staged, not written`) and a **Write
+6 changes to ref.bib** button appears. That one click takes a single backup and
+makes a single atomic write, and it is all-or-nothing: if any staged edit no longer
+applies, none of them are written, so the file is never left holding half a review.
+
+Staged edits are kept in the browser against the bibliography's full path, so
+closing the tab does not lose them, and `Unstage` takes one back off the pile.
+Marking an entry **checked** is not a file edit and still saves immediately — that
+store exists precisely so a judgement survives a restart.
 
 The citation key is always kept, whatever the pasted or exported BibTeX says. One
 backup per session is written before the first replacement, and every write is

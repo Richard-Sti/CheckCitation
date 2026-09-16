@@ -81,15 +81,17 @@ function entry(over = {}) {
     entry({key: 'A2020'}), entry({key: 'B2019'}), entry({key: 'C2018'}),
     entry({key: 'D2017', issueish: false}),
   ];
-  assert.deepEqual(call('queueKeys', rows, [], []), ['A2020', 'B2019', 'C2018'],
+  assert.deepEqual(call('queueKeys', rows, [], [], {}), ['A2020', 'B2019', 'C2018'],
     'only entries with an issue are queued');
-  assert.deepEqual(call('queueKeys', rows, ['A2020'], []), ['B2019', 'C2018', 'A2020'], 'a deferred entry goes last');
-  assert.deepEqual(call('queueKeys', rows, [], ['C2018']), ['C2018', 'A2020', 'B2019'], 'a focused entry goes first');
+  assert.deepEqual(call('queueKeys', rows, ['A2020'], [], {}), ['B2019', 'C2018', 'A2020'], 'a deferred entry goes last');
+  assert.deepEqual(call('queueKeys', rows, [], ['C2018'], {}), ['C2018', 'A2020', 'B2019'], 'a focused entry goes first');
+  assert.deepEqual(call('queueKeys', rows, [], [], {B2019: '@ARTICLE{B2019, title = {new}}'}), ['A2020', 'C2018'],
+    'a staged entry is decided, even though nothing is written yet');
 
   const checked = rows.map(r => r.key === 'B2019' ? {...r, accepted: true} : r);
-  assert.deepEqual(call('queueKeys', checked, [], []), ['A2020', 'C2018'],
+  assert.deepEqual(call('queueKeys', checked, [], [], {}), ['A2020', 'C2018'],
     'an entry accepted on a previous run is never raised again');
-  assert.deepEqual(call('queueKeys', checked, [], ['B2019']), ['B2019', 'A2020', 'C2018'],
+  assert.deepEqual(call('queueKeys', checked, [], ['B2019'], {}), ['B2019', 'A2020', 'C2018'],
     'unless you deliberately pull it back in');
   console.log('ok: the queue honours acceptance that outlived the tab');
 }
@@ -144,12 +146,12 @@ function entry(over = {}) {
   set('drafts = {}; fetchedAuto = {}; confirming = null; history = [];');
   const safe = call('cardBody', entry());
   assert.match(safe, /class="btn good" data-apply/, 'a vetted export gets the plain Replace button');
-  assert.match(safe, /l replace/, 'and keeps the keyboard');
+  assert.match(safe, /l stage/, 'and keeps the keyboard');
 
   const risky = call('cardBody', entry({auto: false, status: 'ADS_RECORD_CONFLICT', conflicts: ['title']}));
   assert.match(risky, /class="btn danger" data-apply/, 'a possible different paper gets the danger button');
   assert.match(risky, /needs the button/, 'and says the keyboard will not do it');
-  assert.ok(!risky.includes('l replace'), 'the replace key must not be advertised on a risky card');
+  assert.ok(!risky.includes('l stage'), 'the stage key must not be advertised on a risky card');
 
   set("confirming = 'Smith2020';");
   assert.match(call('cardBody', entry({auto: false})), /data-confirm="Smith2020"/,
@@ -163,12 +165,12 @@ function entry(over = {}) {
   const lazy = call('cardBody', entry({ads_bibtex: '', status: 'IDENTIFIER_MISMATCH', auto: false}));
   assert.match(lazy, /data-fetch="Smith2020" data-bibcode="2020ApJ\.\.\.900\.\.\.\.1S"/,
     'an ADS candidate with no export yet must be fetchable');
-  assert.match(lazy, /data-apply="Smith2020"\s+disabled/, 'and Replace stays disabled until there is text');
+  assert.match(lazy, /data-apply="Smith2020"\s+disabled/, 'and Stage stays disabled until there is text');
 
   set("drafts = {Smith2020: '@ARTICLE{Smith2020, title = {pasted}}'};");
   const pasted = call('cardBody', entry({ads_bibtex: '', auto: false}));
   assert.ok(pasted.includes('pasted'), 'a draft outranks the proposal');
-  assert.ok(!/data-apply="Smith2020"\s+disabled/.test(pasted), 'and enables Replace');
+  assert.ok(!/data-apply="Smith2020"\s+disabled/.test(pasted), 'and enables Stage');
   console.log('ok: a lazily fetched or pasted replacement drives the buttons');
 }
 
@@ -251,45 +253,58 @@ function entry(over = {}) {
   console.log('ok: stats drive the filter, and Clear decisions hides when there is nothing to clear');
 }
 
-/* ---- Save: only what is genuinely unapplied, and never past a confirmation ---- */
-{
-  const {call} = page();
-  const rows = [entry({key: 'A2020', raw: '@ARTICLE{A2020, title = {old}}'}), entry({key: 'B2019'})];
-  assert.deepEqual(call('pendingKeys', rows, {}), [], 'nothing typed, nothing pending');
-  assert.deepEqual(call('pendingKeys', rows, {A2020: '  @ARTICLE{A2020, title = {old}}  '}), [],
-    'text identical to the file is not an edit');
-  assert.deepEqual(call('pendingKeys', rows, {A2020: '@ARTICLE{A2020, title = {new}}'}), ['A2020']);
-  assert.deepEqual(call('pendingKeys', rows, {Gone2000: 'whatever'}), [],
-    'a draft for an entry that no longer exists is not pending');
-  console.log('ok: only text you typed and have not applied counts as unsaved');
-}
-
+/* ---- staging decides; Write is the only thing that touches the file ---- */
 (async () => {
   const sent = [];
   const {nodes, read, call, set} = page({
     fetch: async (url, options = {}) => {
-      sent.push(JSON.parse(options.body));
+      sent.push({url, body: JSON.parse(options.body)});
       return {ok: true, status: 200, json: async () => ({
         revision: 'r2', entries: [], counts: [], duplicates: [], warnings: [], tex: null,
-        replaced: 1, skipped: 0, source: 'ref.bib', notice: 'saved',
+        replaced: 2, skipped: 0, source: 'ref.bib', notice: 'Wrote 2 changes to ref.bib; backup at ref.bib.bak',
       })};
     },
   });
   const rows = [
-    // Vetted: the draft is the ADS export, untouched.
-    entry({key: 'Safe2020', auto: true, raw: '@ARTICLE{Safe2020, title = {old}}',
-           ads_bibtex: '@ARTICLE{Safe2020, title = {new}}'}),
-    entry({key: 'Risky2019', auto: false, conflicts: ['title'], raw: '@ARTICLE{Risky2019, title = {old}}'}),
+    entry({key: 'A2020', auto: true, raw: '@ARTICLE{A2020, title = {old}}', ads_bibtex: '@ARTICLE{A2020, title = {new}}'}),
+    entry({key: 'B2019', auto: true, raw: '@ARTICLE{B2019, title = {old}}', ads_bibtex: '@ARTICLE{B2019, title = {new}}'}),
   ];
-  set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; revision = 'r1'; busy = false;`);
-  set("deferred = []; focus = []; fetchedAuto = {}; vetted = {}; history = []; confirming = null; lastError = '';");
-  set("drafts = {Safe2020: '@ARTICLE{Safe2020, title = {new}}', Risky2019: '@ARTICLE{Risky2019, title = {new}}'};");
+  set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; filePath = '/p/ref.bib'; revision = 'r1'; busy = false;`);
+  set("deferred = []; focus = []; drafts = {}; staged = {}; fetchedAuto = {}; vetted = {}; history = []; confirming = null; blockedDrafts = true;");
 
-  await read('saveAll()');
-  assert.deepEqual(sent.map(s => s.key), ['Safe2020'], 'a risky edit must not be written in bulk');
-  assert.deepEqual(read('focus'), ['Risky2019'], 'it goes to the front of the queue instead');
-  assert.match(nodes.note.textContent, /confirm each on its card/);
-  console.log('ok: Save writes the vetted edits and refuses to bulk-apply a risky one');
+  call('stage', 'A2020', '@ARTICLE{A2020, title = {new}}');
+  call('stage', 'B2019', '@ARTICLE{B2019, title = {new}}');
+  assert.equal(sent.length, 0, 'staging must not touch the file');
+  assert.deepEqual(read('stagedKeys(staged, entries)'), ['A2020', 'B2019']);
+  assert.deepEqual(read('queueKeys(entries, deferred, focus, staged)'), [], 'a staged entry is decided');
+  assert.match(nodes.source.textContent, /2 staged, not written/);
+  assert.equal(nodes['btn-write'].hidden, false);
+  assert.match(nodes['btn-write'].textContent, /Write 2 changes to ref\.bib/);
+
+  call('unstage', 'B2019');
+  assert.deepEqual(read('stagedKeys(staged, entries)'), ['A2020'], 'unstaging takes it back off the pile');
+
+  await read('writeAll()');
+  assert.deepEqual(sent.map(s => s.url), ['/api/commit'], 'one request writes everything');
+  assert.deepEqual(Object.keys(sent[0].body.edits), ['A2020']);
+  assert.deepEqual(read('staged'), {}, 'staged edits clear once the server has them');
+  assert.deepEqual(read('history').map(h => h.key), ['A2020'], 'and become undoable');
+  console.log('ok: staging decides, and one Write is the only thing that touches the file');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+
+(async () => {
+  // A refused write must keep every staged edit: it is the only copy.
+  const {nodes, read, call, set} = page({
+    fetch: async () => ({ok: false, status: 409, json: async () => ({error: 'The .bib changed since this tab loaded it.'})}),
+  });
+  const rows = [entry({key: 'A2020', auto: true, raw: '@ARTICLE{A2020, title = {old}}'})];
+  set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; filePath = '/p/ref.bib'; revision = 'r1'; busy = false;`);
+  set("deferred = []; focus = []; drafts = {}; staged = {A2020: '@ARTICLE{A2020, title = {new}}'}; fetchedAuto = {}; vetted = {}; history = []; blockedDrafts = true;");
+  await read('writeAll()');
+  assert.deepEqual(read('stagedKeys(staged, entries)'), ['A2020'], 'a refused write must not lose the review');
+  assert.deepEqual(read('history'), [], 'and must not claim anything was written');
+  assert.match(nodes.note.textContent, /changed since this tab/);
+  console.log('ok: a refused write keeps every staged edit');
 })().catch(e => { console.error(e); process.exitCode = 1; });
 
 /* ---- drafts belong to one bibliography, not to every "ref.bib" ---- */
@@ -300,8 +315,10 @@ function entry(over = {}) {
   });
   set("source = 'ref.bib'; filePath = '/Users/me/PaperA/ref.bib';");
   set("drafts = {Riess2022: 'A-only text'}; blockedDrafts = false; persistDrafts();");
-  assert.deepEqual(Object.keys(stored), ['ads-review-drafts:/Users/me/PaperA/ref.bib'],
+  assert.ok(stored['ads-review-drafts:/Users/me/PaperA/ref.bib'],
     'keying on the file name offers one paper\'s edit on another paper\'s entry');
+  assert.ok(Object.keys(stored).every(k => k.endsWith('/Users/me/PaperA/ref.bib')),
+    'both drafts and staged edits are scoped to the path');
 
   set("filePath = '/Users/me/PaperB/ref.bib'; drafts = {};");
   call('readDrafts');
@@ -309,27 +326,10 @@ function entry(over = {}) {
   console.log('ok: drafts are scoped to the bibliography, not to its file name');
 }
 
-/* ---- a save that is refused says which entry and why ---- */
-(async () => {
-  const {nodes, read, set} = page({
-    fetch: async () => ({ok: false, status: 400, json: async () => ({error: 'replacement must be exactly one BibTeX entry'})}),
-  });
-  const rows = [entry({key: 'A2020', auto: true, raw: '@ARTICLE{A2020, title = {old}}',
-                       ads_bibtex: '@ARTICLE{A2020, title = {new}}'})];
-  set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; revision = 'r1'; busy = false;`);
-  set("deferred = []; focus = []; fetchedAuto = {}; vetted = {}; history = []; confirming = null; lastError = '';");
-  set("drafts = {A2020: '@ARTICLE{A2020, title = {new}}'};");
-  await read('saveAll()');
-  assert.match(nodes.note.textContent, /A2020 was refused/, 'the failing entry is named');
-  assert.match(nodes.note.textContent, /exactly one BibTeX entry/, 'and the reason survives');
-  assert.match(nodes.note.textContent, /0 saved before it/);
-  console.log('ok: a refused save reports which entry and why, not "Saved 0"');
-})().catch(e => { console.error(e); process.exitCode = 1; });
-
 /* ---- a replacement that would change nothing is not offered ---- */
 {
   const {call, set} = page();
-  set('drafts = {}; fetchedAuto = {}; vetted = {}; confirming = null; history = [];');
+  set('drafts = {}; staged = {}; fetchedAuto = {}; vetted = {}; confirming = null; history = [];');
   const raw = '@ARTICLE{Hoffman2014,\n  title = {NUTS}\n}';
   const same = call('cardBody', entry({
     key: 'Hoffman2014', raw, ads_bibtex: raw, identical: true,
@@ -502,7 +502,7 @@ function entry(over = {}) {
     },
   });
   set(`entries = ${JSON.stringify([entry({key: 'A2020'}), entry({key: 'B2019'})])};`);
-  set("deferred = []; focus = []; drafts = {}; fetchedAuto = {}; busy = false; revision = 'r1';");
+  set("deferred = []; focus = []; drafts = {}; staged = {}; fetchedAuto = {}; vetted = {}; busy = false; revision = 'r1';");
 
   call('act', 'keep');
   await new Promise(resolve => setImmediate(resolve));
