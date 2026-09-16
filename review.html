@@ -119,7 +119,7 @@ h3 { font-size:13.5px; margin:18px 0 6px }
   <h1>ADS citation review</h1>
   <span id="source"></span>
   <span class="spacer"></span>
-  <button class="btn good" id="btn-write" hidden>Write</button>
+  <button class="btn good" id="btn-write" disabled>Nothing to write</button>
   <button class="btn" id="btn-recheck">Re-check</button>
   <button class="btn" id="btn-clear" hidden>Clear decisions</button>
   <button class="btn" id="btn-reload" hidden>Reload from disk</button>
@@ -564,8 +564,11 @@ function stats() {
   $('source').textContent = waiting
     ? `${source} · ${waiting} staged, not written`
     : unapplied ? `${source} · ${unapplied} unapplied` : `${source} · saved`;
-  $('btn-write').hidden = waiting === 0;
-  $('btn-write').textContent = `Write ${waiting} change${waiting === 1 ? '' : 's'} to ${source}`;
+  // Always on show, so there is never a question of where it went.
+  $('btn-write').disabled = waiting === 0;
+  $('btn-write').textContent = waiting
+    ? `Write ${waiting} change${waiting === 1 ? '' : 's'} to ${source}`
+    : 'Nothing to write';
   $('write-summary').textContent =
     `Write ${waiting} change${waiting === 1 ? '' : 's'} to ${source}? One backup is kept, and nothing else is touched.`;
   if (!waiting) $('write-confirm').hidden = true;

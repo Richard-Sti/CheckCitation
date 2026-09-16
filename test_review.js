@@ -278,8 +278,17 @@ function entry(over = {}) {
   assert.deepEqual(read('stagedKeys(staged, entries)'), ['A2020', 'B2019']);
   assert.deepEqual(read('queueKeys(entries, deferred, focus, staged)'), [], 'a staged entry is decided');
   assert.match(nodes.source.textContent, /2 staged, not written/);
-  assert.equal(nodes['btn-write'].hidden, false);
+  assert.equal(nodes['btn-write'].disabled, false);
   assert.match(nodes['btn-write'].textContent, /Write 2 changes to ref\.bib/);
+
+  // With nothing staged it stays on show, disabled, so it is never "missing".
+  set('staged = {};');
+  call('stats');
+  assert.equal(nodes['btn-write'].hidden, false, 'the Write button is always visible');
+  assert.equal(nodes['btn-write'].disabled, true);
+  assert.equal(nodes['btn-write'].textContent, 'Nothing to write');
+  set("staged = {A2020: '@ARTICLE{A2020, title = {new}}', B2019: '@ARTICLE{B2019, title = {new}}'};");
+  call('stats');
 
   call('unstage', 'B2019');
   assert.deepEqual(read('stagedKeys(staged, entries)'), ['A2020'], 'unstaging takes it back off the pile');
