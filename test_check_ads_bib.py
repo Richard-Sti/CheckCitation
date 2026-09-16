@@ -82,14 +82,25 @@ def test_matching_key_is_clean():
     assert identity_conflicts(local, ads) == []
 
 
-def test_key_year_tolerance_and_drift():
-    """Preprint-vs-journal drift is fine; a four-year gap is not."""
+def test_a_year_that_disagrees_is_a_warning_not_a_conflict():
+    """Keying by the journal year while the entry is the preprint is a naming choice.
+
+    The entry still resolves to that record, and renaming the key is a decision
+    about every \\cite{} in the .tex, so it is reported and not queued.
+    """
     base = """@ARTICLE{Smith2020,
               author = {{Smith}, J.}, title = {A title}, year = {%s}}"""
-    for year, expected in (("2019", []), ("2020", []), ("2021", []), ("2024", ["key"])):
+    for year in ("2019", "2020", "2021", "2024", "2011"):
         local = entry(base % "2020")
-        ads = parsed_ads_entry(local, base % year)
-        assert identity_conflicts(local, ads) == expected, (year, identity_conflicts(local, ads))
+        ads_side = parsed_ads_entry(local, base % year)
+        assert identity_conflicts(local, ads_side) == [], (year, identity_conflicts(local, ads_side))
+        drift = check_ads_bib.key_year_drift(local.key, ads_side)
+        assert (drift != 0) == (abs(int(year) - 2020) > 1), (year, drift)
+
+    local = entry(base % "2011")
+    notes = check_ads_bib.entry_warnings([(local, AdsResult("OK", "", [], ads_bibtex=base % "2011"))])
+    assert len(notes) == 1 and "citation key says 2020" in notes[0][1], notes
+    assert "rename the key" in notes[0][2]
 
 
 def test_corporate_and_particle_surnames_survive():
@@ -723,8 +734,9 @@ def test_an_arxiv_version_suffix_is_the_same_paper():
 
 def test_a_key_only_disagreement_is_not_a_replacement():
     """The key is kept by design, so replacing the body can never resolve this."""
+    # The key names Gelman; the record's first author is Hoffman.
     local = entry(
-        """@ARTICLE{Hoffman2014, author = {{Hoffman}, Matthew D.},
+        """@ARTICLE{Gelman2011, author = {{Hoffman}, Matthew D.},
            title = {The No-U-Turn Sampler}, year = {2011}}"""
     )
     export = """@ARTICLE{2011arXiv1111.4246H, author = {{Hoffman}, Matthew D.},
@@ -742,7 +754,7 @@ def test_a_key_only_disagreement_is_not_a_replacement():
     assert result.ads_bibtex, "the side-by-side still needs the export"
 
     # A conflict that is not only the key keeps its old status and its replacement.
-    wrong = entry("""@ARTICLE{Hoffman2014, author = {{Hoffman}, M.}, title = {Something else entirely}, year = {2011}}""")
+    wrong = entry("""@ARTICLE{Gelman2011, author = {{Hoffman}, M.}, title = {Something else entirely}, year = {2011}}""")
     with patch.object(check_ads_bib, "ads_export_bibtex", lambda *a, **k: export):
         other = check_ads_bib.verify_ads_bibtex(
             wrong, "2011arXiv1111.4246H",

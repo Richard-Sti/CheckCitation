@@ -1032,11 +1032,28 @@ def names_agree(left: str, right: str) -> bool:
     return left in right or right in left
 
 
+def key_year_drift(key: str, ads_entry: BibEntry) -> int:
+    """Years between a `Surname2020` key and the record it resolves to, or 0.
+
+    Keying by the journal year while the entry points at the arXiv preprint is a
+    naming choice, not a wrong citation, so this is reported as a warning and
+    never as a conflict. +/-1 is absorbed entirely.
+    """
+    match = CITATION_KEY_RE.match(key)
+    ads_year = ads_entry.fields.get("year", "") if ads_entry else ""
+    if not match or not ads_year.isdigit():
+        return 0
+    drift = int(match.group("year")) - int(ads_year)
+    return drift if abs(drift) > 1 else 0
+
+
 def key_conflicts(key: str, ads_entry: BibEntry) -> bool:
-    """True when a `Surname2020`-style key disagrees with the resolved ADS record.
+    """True when a `Surname2020`-style key names someone other than the first author.
 
     This is the only signal independent of the entry's own fields, so it is what
-    catches an internally consistent entry that is simply the wrong paper.
+    catches an internally consistent entry that is simply the wrong paper. Only the
+    surname: a year that disagrees is a warning, because the entry is still that
+    record and renaming the key is a decision about the .tex, not about the .bib.
     """
     match = CITATION_KEY_RE.match(key)
     if not match:
@@ -1054,11 +1071,8 @@ def key_conflicts(key: str, ads_entry: BibEntry) -> bool:
         # `cross-correlation`, which silently switched off the one check that
         # catches an internally consistent entry naming the wrong paper.
         title_words = set(WORD_RE.findall(normalized_identity_value(ads_entry.fields.get("title", ""))))
-        if len(name) < 4 or name not in title_words:
-            return True
-    ads_year = ads_entry.fields.get("year", "")
-    # ponytail: +/-1 absorbs preprint-vs-journal year drift.
-    return ads_year.isdigit() and abs(int(ads_year) - int(match.group("year"))) > 1
+        return len(name) < 4 or name not in title_words
+    return False
 
 
 def identity_conflicts(entry: BibEntry, ads_entry: BibEntry) -> list[str]:
@@ -1980,16 +1994,40 @@ def print_duplicates(results: list[tuple[BibEntry, AdsResult]]) -> int:
     return len(duplicates)
 
 
-def print_warnings(entries: list[BibEntry]) -> None:
-    malformed = [entry for entry in entries if malformed_author(entry)]
+def entry_warnings(results: list[tuple[BibEntry, AdsResult]]) -> list[tuple[BibEntry, str, str]]:
+    """Advisory notes: real, worth knowing, and not something to decide in the app."""
+    notes: list[tuple[BibEntry, str, str]] = []
+    for entry, result in results:
+        if malformed_author(entry):
+            notes.append((
+                entry,
+                "author field contains a literal 'et al.', which renders as '(Smith & et al. 2020)'",
+                "replace it with the remaining author names, or with BibTeX's 'and others'",
+            ))
+        ads_entry = parsed_ads_entry(entry, result.ads_bibtex) if result.ads_bibtex else None
+        if ads_entry is None:
+            continue
+        if drift := key_year_drift(entry.key, ads_entry):
+            notes.append((
+                entry,
+                f"the citation key says {CITATION_KEY_RE.match(entry.key).group('year')}, but this record is "
+                f"{ads_entry.fields.get('year', '')} ({abs(drift)} years {'later' if drift > 0 else 'earlier'})",
+                "usually the key names the journal year while the entry is the preprint; rename the key, "
+                "or point the entry at the published record, or leave it",
+            ))
+    return notes
+
+
+def print_warnings(results: list[tuple[BibEntry, AdsResult]]) -> None:
+    notes = entry_warnings(results)
     print("\nWarnings")
-    if not malformed:
+    if not notes:
         print("  None")
         return
-    for entry in malformed:
+    for entry, issue, action in notes:
         print(f"  {entry.key} (line {entry.line})")
-        print_detail("Issue", "author field contains a literal 'et al.', which renders as '(Smith & et al. 2020)'")
-        print_detail("Action", "replace it with the remaining author names, or with BibTeX's 'and others'")
+        print_detail("Issue", issue)
+        print_detail("Action", action)
 
 
 def cited_keys(text: str) -> set[str]:
@@ -2049,7 +2087,7 @@ def print_report(results: list[tuple[BibEntry, AdsResult]], verbose: bool) -> in
         print("  None")
 
     duplicate_count = print_duplicates(results)
-    print_warnings([entry for entry, _ in results])
+    print_warnings(results)
 
     if verbose:
         ok_results = [(entry, result) for entry, result in results if result.status not in ISSUE_STATUSES]

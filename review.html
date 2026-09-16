@@ -659,7 +659,8 @@ function renderCheck() {
     : '<p class="empty">No two entries resolve to the same ADS record.</p>';
   $('warn-rows').innerHTML = warns.length
     ? `<ul class="plain">${warns.map(w =>
-        `<li><code>${esc(w.key)}</code> (line ${w.line}) — ${esc(w.issue)}</li>`).join('')}</ul>`
+        `<li><code>${esc(w.key)}</code> (line ${w.line}) — ${esc(w.issue)}` +
+        `${w.action ? `<br><span class="meta">${esc(w.action)}</span>` : ''}</li>`).join('')}</ul>`
     : '<p class="empty">Nothing to warn about.</p>';
   if (!tex) {
     $('tex-rows').innerHTML = '<p class="empty">Pass --tex to cross-check which keys the paper actually cites.</p>';

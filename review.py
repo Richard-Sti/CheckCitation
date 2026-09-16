@@ -318,7 +318,7 @@ class Review:
             "counts": ads.ordered_counts(counts),
             "skipped": len(skipped),
             "duplicates": duplicates(self.results),
-            "warnings": warnings(self.entries),
+            "warnings": warnings(self.results),
             "tex": tex_crosscheck(self.entries, self.tex),
             "statuses": list(ads.STATUS_ORDER),
         }
@@ -422,15 +422,11 @@ def duplicates(results):
     ]
 
 
-def warnings(entries):
+def warnings(results):
+    """Advisory notes: real, worth knowing, and not something to decide on a card."""
     return [
-        {
-            "key": entry.key,
-            "line": entry.line,
-            "issue": "author field contains a literal 'et al.', which renders as '(Smith & et al. 2020)'",
-        }
-        for entry in entries
-        if ads.malformed_author(entry)
+        {"key": entry.key, "line": entry.line, "issue": issue, "action": action}
+        for entry, issue, action in ads.entry_warnings(results)
     ]
 
 

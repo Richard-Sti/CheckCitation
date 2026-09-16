@@ -173,13 +173,19 @@ compared fuzzily after LaTeX markup is stripped, so `H\,{\sc i}` and `H I` agree
 but their series numbering has to match exactly: `Paper I` and `Paper II` score
 0.99 on a character ratio and are not the same paper.
 The citation key check is the only signal independent of the entry's own fields:
-a key of the form `Surname2020` is compared against the record's first author and
-year, which is what catches an entry that is internally consistent but is simply
-the wrong paper. When that is the *only* disagreement the entry is reported
+a key of the form `Surname2020` is compared against the record's **first author**,
+which is what catches an entry that is internally consistent but is simply the
+wrong paper. When that is the only disagreement the entry is reported
 `CITATION_KEY_CONFLICT` and **no replacement is offered**: the citation key is kept
 by design, so rewriting the body could only ever produce the same file. Renaming
 the key means renaming every `\cite{}` to it, so that decision stays yours — or
-paste the record the key actually names, which is still allowed. A survey or collaboration key names the project rather than the
+paste the record the key actually names, which is still allowed.
+
+A key whose **year** disagrees is a *warning*, not an issue. `Hoffman2014` pointing
+at the 2011 arXiv preprint means the key names the journal year and the entry is
+the preprint — the entry still is that record, so there is nothing to decide in the
+app and nothing to fail a build over. It is listed under `Warnings` with what you
+might do about it, and it does not affect the exit code. A survey or collaboration key names the project rather than the
 author — `CosmoVerse2025` resolves to a paper by Di Valentino — so a key of four
 characters or more that appears in the record's title is accepted as well. Disagreement is reported as `ADS_RECORD_CONFLICT` and the entry
 is never offered as a one-keypress replacement.
