@@ -51,7 +51,7 @@ main:has(#view-all:not([hidden])) { max-width:1040px }
 .empty { color:var(--dim); font-style:italic }
 
 /* The 1px gap is the hairline between stats. */
-.stats { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line);
+.stats { display:grid; grid-template-columns:repeat(5,1fr); gap:1px; background:var(--line);
          border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:14px }
 .stat { background:var(--card); padding:9px 12px }
 .stat b { display:block; font-size:19px; font-variant-numeric:tabular-nums; font-weight:600 }
@@ -87,6 +87,9 @@ textarea { width:100%; min-height:150px; padding:9px; border:1px solid var(--lin
 .keys { color:var(--dim); font-size:12px; margin:8px 0 0 }
 .confirm { background:var(--bad-bg); color:var(--bad); padding:8px 11px; border-radius:7px;
            display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; font-size:13.5px }
+pre.bib { margin:0 0 4px; padding:9px 11px; border:1px solid var(--line); border-radius:7px;
+          background:var(--bg); font-size:12.5px; line-height:1.45; max-height:220px;
+          overflow:auto; white-space:pre-wrap; word-break:break-word }
 .handoff { background:var(--warn-bg); color:var(--warn); padding:9px 11px; border-radius:7px; font-size:13.5px }
 .handoff a, .card a { color:inherit }
 .recent li { font-size:13px; margin-bottom:3px }
@@ -105,6 +108,7 @@ h3 { font-size:13.5px; margin:18px 0 6px }
 .plain li { font-size:13.5px }
 
 @media (prefers-reduced-motion:no-preference) { .card { transition:opacity .12s } }
+@media (max-width:900px) { .stats { grid-template-columns:repeat(3,1fr) } }
 @media (max-width:620px) { .stats { grid-template-columns:repeat(2,1fr) } }
 </style>
 
@@ -127,13 +131,15 @@ h3 { font-size:13.5px; margin:18px 0 6px }
   <div class="stats">
     <div class="stat s-ok"><b id="s-ok">0</b><span>Agrees with ADS</span></div>
     <div class="stat s-bad"><b id="s-issues">0</b><span>Needs a decision</span></div>
+    <div class="stat"><b id="s-accepted">0</b><span>Checked and fine</span></div>
     <div class="stat"><b id="s-replaced">0</b><span>Replaced</span></div>
     <div class="stat"><b id="s-skipped">0</b><span>Not checked</span></div>
   </div>
 
   <section id="view-review">
     <p class="lead">Entries ADS disagrees with, in file order. The citation key is always kept;
-      only the entry body is rewritten, behind one backup per session.</p>
+      only the entry body is rewritten, behind one backup per session. Marking one
+      <em>checked</em> is remembered beside the .bib, so it is not raised again until you edit it.</p>
     <div id="card"></div>
     <p class="empty" id="review-empty" hidden>Nothing left to decide.</p>
     <h3 id="recent-head" hidden>Replaced this session</h3>
@@ -146,6 +152,7 @@ h3 { font-size:13.5px; margin:18px 0 6px }
       <button data-filter="all" aria-pressed="true">All</button>
       <button data-filter="issues" aria-pressed="false">Issues</button>
       <button data-filter="ok" aria-pressed="false">Agrees with ADS</button>
+      <button data-filter="accepted" aria-pressed="false">Checked and fine</button>
       <button data-filter="skip" aria-pressed="false">Skipped</button>
     </div>
     <label class="sort">Sort <select id="sort-all" data-sort aria-label="Sort entries"></select></label>
@@ -184,10 +191,13 @@ const tag = status => `<span class="tag t-${tone(status)}">${esc(label(status))}
 
 const byKey = (entries, key) => entries.find(e => e.key === key) || null;
 
-// The queue is derived, never stored: an entry leaves it because the server says
-// it is OK now, not because the page remembered a click.
-function queueKeys(entries, dismissed, deferred, focus) {
-  const open = entries.filter(e => e.issueish && !dismissed.includes(e.key)).map(e => e.key);
+// The queue is derived, never stored: an entry leaves it because ADS now agrees,
+// or because you accepted it - and that acceptance lives beside the .bib, so it
+// survives the tab, the restart and the next run.
+function queueKeys(entries, deferred, focus) {
+  const open = entries
+    .filter(e => e.issueish && (!e.accepted || focus.includes(e.key)))
+    .map(e => e.key);
   const rank = key => focus.includes(key) ? 0 : deferred.includes(key) ? 2 : 1;
   return open.slice().sort((a, b) => rank(a) - rank(b));
 }
@@ -204,7 +214,8 @@ function sortRows(items, mode) {
 }
 
 function matchesFilter(entry, filter) {
-  if (filter === 'issues') return entry.issueish;
+  if (filter === 'accepted') return entry.accepted;
+  if (filter === 'issues') return entry.issueish && !entry.accepted;
   if (filter === 'ok') return entry.status === 'OK';
   if (filter === 'skip') return entry.skip;
   return true;
@@ -233,6 +244,13 @@ function matchList(entry) {
   return `<h3>ADS returned ${entry.matches.length} record${entry.matches.length > 1 ? 's' : ''}</h3><ul class="plain">${rows}</ul>`;
 }
 
+// What is in the file right now, key and all. The CLI prints this before it will
+// take a replacement, and the card has to show it for the same reason: you cannot
+// judge a proposal without the thing it would overwrite.
+function currentEntry(entry) {
+  return `<h3>Current entry, line ${entry.line}</h3><pre class="bib">${esc(entry.raw)}</pre>`;
+}
+
 // Nothing resolved, so the card stops proposing and starts helping the user look.
 function handoff(entry) {
   if (!entry.search_url) return '';
@@ -247,7 +265,7 @@ const $ = id => document.getElementById(id);
 
 let entries = [], counts = [], dupes = [], warns = [], tex = null;
 let revision = null, replaced = 0, skipped = 0, source = '';
-let dismissed = [], deferred = [], focus = [], history = [];
+let deferred = [], focus = [], history = [], acceptedError = '';
 let drafts = {}, fetchedAuto = {}, blockedDrafts = false;
 let busy = false, stale = false, filter = 'all', confirming = null;
 let requestQueue = Promise.resolve();
@@ -309,9 +327,9 @@ function adopt(payload) {
   replaced = payload.replaced;
   skipped = payload.skipped;
   source = payload.source;
+  acceptedError = payload.accepted_error || '';
   // Anything the server now calls settled cannot stay queued or deferred.
   const live = new Set(entries.filter(e => e.issueish).map(e => e.key));
-  dismissed = dismissed.filter(k => live.has(k));
   deferred = deferred.filter(k => live.has(k));
   focus = focus.filter(k => live.has(k));
 }
@@ -325,7 +343,8 @@ async function load() {
     if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
     adopt(res.body);
     readDrafts();
-    note(blockedDrafts ? 'Saved drafts could not be read; they were left untouched.' : '');
+    note(acceptedError || (blockedDrafts ? 'Saved drafts could not be read; they were left untouched.' : ''),
+      !!acceptedError);
   } catch (e) {
     note(e.message, true);
   } finally {
@@ -375,6 +394,24 @@ async function replace(key, bibtex) {
   }
 }
 
+async function accept(key, accepted) {
+  if (busy) return;
+  busy = true;
+  note(accepted ? `Recording ${key} as checked…` : `Putting ${key} back in the queue…`);
+  try {
+    const res = await apiFetch('/api/accept', {method: 'POST', body: JSON.stringify({key, accepted})});
+    if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
+    adopt(res.body);
+    focus = focus.filter(k => k !== key);
+    note(res.body.notice || '');
+  } catch (e) {
+    note(e.message, true);
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
 async function undo(index) {
   const item = history[index];
   if (!item || busy) return;
@@ -408,11 +445,12 @@ async function fetchExport(key, bibcode) {
 function stats() {
   const ok = entries.filter(e => e.status === 'OK').length;
   $('s-ok').textContent = ok;
-  $('s-issues').textContent = entries.filter(e => e.issueish).length;
+  $('s-issues').textContent = entries.filter(e => e.issueish && !e.accepted).length;
+  $('s-accepted').textContent = entries.filter(e => e.accepted).length;
   $('s-replaced').textContent = replaced;
   $('s-skipped').textContent = skipped;
   $('source').textContent = source;
-  $('n-review').textContent = queueKeys(entries, dismissed, deferred, focus).length || '';
+  $('n-review').textContent = queueKeys(entries, deferred, focus).length || '';
   $('n-all').textContent = entries.length || '';
   $('n-check').textContent = (dupes.length + warns.length + (tex ? tex.undefined.length : 0)) || '';
 }
@@ -429,8 +467,9 @@ function cardBody(entry) {
     ${entry.conflicts.length ? `<p class="meta">ADS disagrees on: <b>${esc(entry.conflicts.join(', '))}</b></p>` : ''}
     ${diffTable(entry)}
     ${matchList(entry)}
+    ${currentEntry(entry)}
     ${handoff(entry)}
-    <h3>Replacement</h3>
+    <h3>Proposed replacement</h3>
     <p class="meta">${esc(entry.action)}</p>
     ${canFetch ? `<p><button class="btn" data-fetch="${esc(entry.key)}" data-bibcode="${esc(entry.candidate)}">Fetch the ADS export for ${esc(entry.candidate)}</button></p>` : ''}
     <textarea id="bibtex" data-draft="${esc(entry.key)}" spellcheck="false"
@@ -438,7 +477,7 @@ function cardBody(entry) {
     <div class="actions">
       <button class="btn ${risky ? 'danger' : 'good'}" data-apply="${esc(entry.key)}" ${draft.trim() ? '' : 'disabled'}>
         ${risky ? 'Replace anyway…' : 'Replace'}</button>
-      <button class="btn" data-keep="${esc(entry.key)}">Keep local</button>
+      <button class="btn" data-keep="${esc(entry.key)}">Checked, it is fine</button>
       <button class="btn" data-defer="${esc(entry.key)}">Defer</button>
       ${history.length ? `<button class="btn" data-undo="0">Undo ${esc(history[0].key)}</button>` : ''}
     </div>
@@ -447,13 +486,13 @@ function cardBody(entry) {
       <button class="btn danger" data-confirm="${esc(entry.key)}">Yes, replace</button>
       <button class="btn" data-cancel="1">Cancel</button></div>` : ''}
     <p class="keys">${risky
-      ? '← / h keep local · space defer · u undo. A risky replacement needs the button.'
-      : '→ / l replace · ← / h keep local · space defer · u undo'}</p>
+      ? '← / h checked and fine · space defer · u undo. A risky replacement needs the button.'
+      : '→ / l replace · ← / h checked and fine · space defer · u undo'}</p>
   </div>`;
 }
 
 function renderCard() {
-  const queue = queueKeys(entries, dismissed, deferred, focus);
+  const queue = queueKeys(entries, deferred, focus);
   const entry = queue.length ? byKey(entries, queue[0]) : null;
   $('card').innerHTML = entry ? cardBody(entry) : '';
   $('review-empty').hidden = !!entry;
@@ -474,7 +513,9 @@ function renderAll() {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><code>${esc(entry.key)}</code></td><td class="num">${entry.line}</td>` +
       `<td>${tag(entry.status)}</td><td>${esc(entry.local.title)}</td>` +
-      `<td>${entry.issueish ? `<button class="btn" data-review="${esc(entry.key)}">Review</button>` : ''}</td>`;
+      `<td>${entry.accepted
+        ? `<button class="btn" data-unaccept="${esc(entry.key)}" title="Put it back in the queue">↺ checked</button>`
+        : entry.issueish ? `<button class="btn" data-review="${esc(entry.key)}">Review</button>` : ''}</td>`;
     body.appendChild(tr);
   });
   wire(body);
@@ -525,7 +566,9 @@ function wire(container) {
   container.querySelectorAll('[data-cancel]').forEach(el =>
     el.onclick = () => { confirming = null; render(); });
   container.querySelectorAll('[data-keep]').forEach(el =>
-    el.onclick = () => act('keep'));
+    el.onclick = () => accept(el.dataset.keep, true));
+  container.querySelectorAll('[data-unaccept]').forEach(el =>
+    el.onclick = () => accept(el.dataset.unaccept, false));
   container.querySelectorAll('[data-defer]').forEach(el =>
     el.onclick = () => act('defer'));
   container.querySelectorAll('[data-undo]').forEach(el =>
@@ -534,7 +577,6 @@ function wire(container) {
     el.onclick = () => fetchExport(el.dataset.fetch, el.dataset.bibcode));
   container.querySelectorAll('[data-review]').forEach(el => el.onclick = () => {
     const key = el.dataset.review;
-    dismissed = dismissed.filter(k => k !== key);
     deferred = deferred.filter(k => k !== key);
     focus = [key, ...focus.filter(k => k !== key)];
     tab('review');
@@ -556,10 +598,14 @@ function currentDraft(key) {
 }
 
 function act(what) {
-  const queue = queueKeys(entries, dismissed, deferred, focus);
+  const queue = queueKeys(entries, deferred, focus);
   if (!queue.length || busy) return;
   const key = queue[0];
   const entry = byKey(entries, key);
+  if (what === 'keep') {
+    accept(key, true);
+    return;
+  }
   if (what === 'replace') {
     if (!entry || !(entry.auto || fetchedAuto[key])) {
       note('ADS disagrees with this entry, so it may be a different paper; use the button.', true);
@@ -569,7 +615,6 @@ function act(what) {
     return;
   }
   focus = focus.filter(k => k !== key);
-  if (what === 'keep') dismissed = [...dismissed, key];
   if (what === 'defer') deferred = [...deferred.filter(k => k !== key), key];
   confirming = null;
   render();

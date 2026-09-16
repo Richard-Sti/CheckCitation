@@ -36,6 +36,7 @@ from check_ads_bib import (
     series_tokens,
     title_similarity,
     titles_conflict,
+    wants_review,
     urlopen_with_retries,
     write_text_atomically,
 )
@@ -565,7 +566,7 @@ def test_the_export_never_carries_a_literal_et_al():
 def test_a_miss_expires_long_before_a_hit():
     """A resolved record does not change; a miss stops being one as soon as ADS indexes it."""
     with tempfile.TemporaryDirectory() as tmp:
-        cache = check_ads_bib.AdsCache(Path(tmp) / "c.json", ttl=30 * 24 * 3600)
+        cache = check_ads_bib.AdsCache(Path(tmp) / "c.json", ttl=check_ads_bib.DEFAULT_CACHE_TTL)
         cache.set("search", "hit", [{"bibcode": "2020ApJ...1....1A"}])
         cache.set("search", "miss", [])
         stale = time.time() - 2 * check_ads_bib.MISS_TTL
@@ -575,6 +576,18 @@ def test_a_miss_expires_long_before_a_hit():
         assert cache.get("search", "miss") is None, "a miss must not"
     assert is_empty_result([]) and is_empty_result("") and is_empty_result(None)
     assert not is_empty_result([{"bibcode": "x"}]) and not is_empty_result("@ARTICLE{}")
+
+
+def test_the_app_is_the_default_but_never_in_a_pipe():
+    """`check_ads_bib.sh ref.bib | less` must not hang on a server nobody opens."""
+    parser = check_ads_bib.build_parser()
+    plain = parser.parse_args(["ref.bib"])
+    assert wants_review(plain, interactive=True), "a terminal gets the app"
+    assert not wants_review(plain, interactive=False), "a pipe gets the report"
+    assert wants_review(parser.parse_args(["ref.bib", "--review"]), interactive=False), "--review forces it"
+    assert not wants_review(parser.parse_args(["ref.bib", "--no-review"]), interactive=True)
+    # --replace is the other way of doing the same job; it must not also serve.
+    assert not wants_review(parser.parse_args(["ref.bib", "--replace"]), interactive=True)
 
 
 def main():

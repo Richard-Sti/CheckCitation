@@ -59,7 +59,7 @@ function entry(over = {}) {
     local: {title: 'A study', author: 'Smith, J.', year: '2020', doi: '', eprint: ''},
     bibcode: '2020ApJ...900....1S', ads: null, ads_bibtex: '@ARTICLE{Smith2020, title = {A}}',
     conflicts: [], matches: [], candidate: '2020ApJ...900....1S', search_url: '',
-    auto: true, manual: false, issueish: true, skip: false, ...over,
+    auto: true, manual: false, issueish: true, accepted: false, skip: false, ...over,
   };
 }
 
@@ -81,12 +81,17 @@ function entry(over = {}) {
     entry({key: 'A2020'}), entry({key: 'B2019'}), entry({key: 'C2018'}),
     entry({key: 'D2017', issueish: false}),
   ];
-  assert.deepEqual(call('queueKeys', rows, [], [], []), ['A2020', 'B2019', 'C2018'],
+  assert.deepEqual(call('queueKeys', rows, [], []), ['A2020', 'B2019', 'C2018'],
     'only entries with an issue are queued');
-  assert.deepEqual(call('queueKeys', rows, ['A2020'], [], []), ['B2019', 'C2018'], 'a kept entry leaves the queue');
-  assert.deepEqual(call('queueKeys', rows, [], ['A2020'], []), ['B2019', 'C2018', 'A2020'], 'a deferred entry goes last');
-  assert.deepEqual(call('queueKeys', rows, [], [], ['C2018']), ['C2018', 'A2020', 'B2019'], 'a focused entry goes first');
-  console.log('ok: the queue derives from status, not from remembered clicks');
+  assert.deepEqual(call('queueKeys', rows, ['A2020'], []), ['B2019', 'C2018', 'A2020'], 'a deferred entry goes last');
+  assert.deepEqual(call('queueKeys', rows, [], ['C2018']), ['C2018', 'A2020', 'B2019'], 'a focused entry goes first');
+
+  const checked = rows.map(r => r.key === 'B2019' ? {...r, accepted: true} : r);
+  assert.deepEqual(call('queueKeys', checked, [], []), ['A2020', 'C2018'],
+    'an entry accepted on a previous run is never raised again');
+  assert.deepEqual(call('queueKeys', checked, [], ['B2019']), ['B2019', 'A2020', 'C2018'],
+    'unless you deliberately pull it back in');
+  console.log('ok: the queue honours acceptance that outlived the tab');
 }
 
 {
@@ -109,6 +114,9 @@ function entry(over = {}) {
   assert.ok(call('matchesFilter', clean, 'ok') && !call('matchesFilter', issue, 'ok'));
   assert.ok(call('matchesFilter', skipped, 'skip') && !call('matchesFilter', clean, 'skip'));
   assert.ok([issue, clean, skipped].every(e => call('matchesFilter', e, 'all')));
+  const done = entry({accepted: true});
+  assert.ok(call('matchesFilter', done, 'accepted') && !call('matchesFilter', issue, 'accepted'));
+  assert.ok(!call('matchesFilter', done, 'issues'), 'an accepted entry is no longer outstanding');
   console.log('ok: every filter is exclusive and "all" hides nothing');
 }
 
@@ -162,6 +170,22 @@ function entry(over = {}) {
   assert.ok(pasted.includes('pasted'), 'a draft outranks the proposal');
   assert.ok(!/data-apply="Smith2020" disabled/.test(pasted), 'and enables Replace');
   console.log('ok: a lazily fetched or pasted replacement drives the buttons');
+}
+
+/* ---- the entry as it stands, which is what the proposal would overwrite ---- */
+{
+  const {call, set} = page();
+  set('drafts = {}; fetchedAuto = {}; confirming = null; history = [];');
+  const raw = '@ARTICLE{Springel2005,\n  title = {GADGET-2},\n  doi = {10.9999/typo}\n}';
+  const body = call('cardBody', entry({raw, line: 12}));
+  assert.match(body, /Current entry, line 12/);
+  assert.match(body, /<pre class="bib">@ARTICLE\{Springel2005,/, 'the old key must be visible, not just the new one');
+  assert.match(body, /10\.9999\/typo/, 'and the field being replaced');
+  assert.ok(body.indexOf('Current entry') < body.indexOf('Proposed replacement'),
+    'the current entry comes before what would replace it');
+  const hostile = call('cardBody', entry({raw: '@ARTICLE{X, note = {<img onerror=x>}}'}));
+  assert.ok(!hostile.includes('<img'), 'the file\'s own text is escaped too');
+  console.log('ok: the card shows the entry it would overwrite, old key included');
 }
 
 /* ---- the handoff, for entries no route resolved ---- */
@@ -268,7 +292,7 @@ function entry(over = {}) {
     fetch: async () => { called += 1; return {ok: true, status: 200, json: async () => ({})}; },
   });
   set(`entries = ${JSON.stringify([entry({auto: false, status: 'ADS_RECORD_CONFLICT', conflicts: ['title']})])};`);
-  set('dismissed = []; deferred = []; focus = []; drafts = {}; fetchedAuto = {}; busy = false;');
+  set('deferred = []; focus = []; drafts = {}; fetchedAuto = {}; busy = false;');
   call('act', 'replace');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(called, 0, 'the replace key must not write a risky candidate');
@@ -280,20 +304,32 @@ function entry(over = {}) {
   console.log('ok: the keyboard respects the server\'s risk verdict');
 })().catch(e => { console.error(e); process.exitCode = 1; });
 
-/* ---- keep and defer never touch the file ---- */
+/* ---- accepting is recorded; deferring is not ---- */
 (async () => {
-  let called = 0;
-  const {read, call, set} = page({fetch: async () => { called += 1; return {ok: true, status: 200, json: async () => ({})}; }});
+  const sent = [];
+  const {read, call, set} = page({
+    fetch: async (url, options = {}) => {
+      sent.push({url, body: JSON.parse(options.body)});
+      return {ok: true, status: 200, json: async () => ({
+        revision: 'r2', entries: [], counts: [], duplicates: [], warnings: [], tex: null,
+        replaced: 0, skipped: 0, source: 'ref.bib', notice: 'A2020 accepted as correct',
+      })};
+    },
+  });
   set(`entries = ${JSON.stringify([entry({key: 'A2020'}), entry({key: 'B2019'})])};`);
-  set('dismissed = []; deferred = []; focus = []; drafts = {}; fetchedAuto = {}; busy = false;');
+  set("deferred = []; focus = []; drafts = {}; fetchedAuto = {}; busy = false; revision = 'r1';");
+
   call('act', 'keep');
-  assert.deepEqual(read('dismissed'), ['A2020']);
-  call('act', 'defer');
-  assert.deepEqual(read('deferred'), ['B2019']);
-  assert.deepEqual(read('queueKeys(entries, dismissed, deferred, focus)'), ['B2019'], 'only the deferred one is left');
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(called, 0, 'keeping and deferring are page-local, never a write');
-  console.log('ok: keep and defer never reach the server');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(sent, [{url: '/api/accept', body: {key: 'A2020', accepted: true}}],
+    'accepting has to reach the server, or it dies with the tab');
+
+  set(`entries = ${JSON.stringify([entry({key: 'A2020'}), entry({key: 'B2019'})])}; busy = false;`);
+  call('act', 'defer');
+  assert.deepEqual(read('deferred'), ['A2020'], 'deferring is a this-session ordering, not a decision');
+  assert.equal(sent.length, 1, 'and never a write');
+  console.log('ok: acceptance is persisted, deferral is not');
 })().catch(e => { console.error(e); process.exitCode = 1; });
 
 /* ---- a full render must not throw on any shape ---- */

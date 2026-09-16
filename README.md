@@ -44,10 +44,21 @@ export CHECK_ADS_BIB_PYTHON=/path/to/venv/bin/python3
 
 ## Usage
 
-Check a bibliography:
+Check a bibliography, and review what came back:
 
 ```sh
 ./check_ads_bib.sh path/to/ref.bib
+```
+
+That prints the report and then opens the browser review app, which is where
+replacements are made. Redirect the output and it prints the report and stops
+instead, so `... | less` and any CI step behave as they always did:
+
+```sh
+./check_ads_bib.sh path/to/ref.bib | less
+./check_ads_bib.sh path/to/ref.bib --no-review     # same, from a terminal
+./check_ads_bib.sh path/to/ref.bib --no-open       # serve it, but don't launch a browser
+./check_ads_bib.sh path/to/ref.bib --review        # force the app on even when piped
 ```
 
 You can also call the Python script directly:
@@ -56,17 +67,11 @@ You can also call the Python script directly:
 python3 check_ads_bib.py path/to/ref.bib
 ```
 
-Review and replace problematic entries interactively:
+Replacements can also be made from the terminal, one prompt at a time, instead of
+in the browser:
 
 ```sh
 ./check_ads_bib.sh path/to/ref.bib --replace
-```
-
-Or do the same in a browser:
-
-```sh
-./check_ads_bib.sh path/to/ref.bib --review
-./check_ads_bib.sh path/to/ref.bib --review --no-open   # don't launch a browser
 ```
 
 Also cross-check which keys your paper actually cites:
@@ -86,8 +91,9 @@ Useful options:
 
 ## The review app
 
-`--review` runs the usual check, prints the usual report, and then serves a local
-page at <http://localhost:8766>. Stdlib only, bound to `127.0.0.1`, no build step
+The app is how you work through what the report found, so it opens by default:
+the usual check runs, the usual report prints, and then a local page is served at
+<http://localhost:8766>. Stdlib only, bound to `127.0.0.1`, no build step
 and nothing to install. The only file it writes is the `.bib` you pointed it at.
 
 Three views under a stats strip:
@@ -99,8 +105,9 @@ Three views under a stats strip:
   entry, `space` defers it to the back of the queue, `u` undoes the last replacement
   by writing the entry back exactly as it was.
 - **All** — every entry with its status and line, filterable to issues, entries that
-  agree with ADS, or skipped ones, sortable by key, line or status. `Review` on any
-  row sends it to the front of the card stack.
+  agree with ADS, ones you have accepted, or skipped ones, sortable by key, line or
+  status. `Review` on any row sends it to the front of the card stack, and `↺ checked`
+  withdraws an acceptance.
 - **Cross-check** — duplicates, warnings, and, when `--tex` is given, the keys cited
   but undefined and the entries defined but never cited.
 
@@ -199,10 +206,17 @@ The tests are offline and use no framework. `test_review.py` stubs ADS and runs 
 real server on an ephemeral port; `test_review.js` runs the page's own `<script>`
 in a `vm` context against a fake document.
 
-ADS responses are cached in `.ads_cache.json`. A record that resolved keeps for
-30 days, because a published record does not change; a lookup that found nothing
+ADS responses are cached in `.ads_cache.json`. A record that resolved keeps for a
+month, because a published record does not change; a lookup that found nothing
 keeps for an hour, because it stops being nothing the moment ADS indexes the
 paper. `--cache-ttl` sets the first, `--refresh-cache` ignores both.
+
+Your own verdicts are kept too. **Checked, it is fine** on a card writes the entry
+to `<name>.checked.json` beside the `.bib`, and that entry is not raised again for
+a month — on this run, the next one, or after a restart. It is keyed to the entry's
+exact text, so editing it withdraws the acceptance and puts it back in the queue;
+`↺ checked` in the **All** view withdraws it by hand. The file is git-ignored, and
+a damaged one is reported and left alone rather than overwritten.
 
 ## The ADS call budget
 
@@ -219,7 +233,7 @@ is spending fewer requests per entry:
 - **One export request per hundred entries, not one per entry.** Every bibcode the
   file already names is exported in bulk before the check starts, and the per-entry
   path then finds it in the cache.
-- **Re-runs cost nothing** inside the 30-day window, which is the loop that matters
+- **Re-runs cost nothing** inside the one-month window, which is the loop that matters
   while you work through the issues.
 
 Measured on 10 real entries exported from ADS, cache cold: **1.1 requests per

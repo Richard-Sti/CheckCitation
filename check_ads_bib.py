@@ -2109,12 +2109,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--review",
         action="store_true",
-        help="Open the browser review app instead of the interactive --replace prompts.",
+        help="Open the browser review app even when the output is piped.",
+    )
+    parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help="Print the report and stop; do not open the browser review app.",
     )
     parser.add_argument(
         "--no-open",
         action="store_true",
-        help="With --review, do not launch a browser.",
+        help="Serve the review app, but do not launch a browser.",
     )
     parser.add_argument(
         "--tex",
@@ -2126,6 +2131,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Print every entry, not only problems.")
     return parser
+
+
+def wants_review(args: argparse.Namespace, interactive: bool) -> bool:
+    """The app is the default way to work through issues; the report alone is for pipes.
+
+    Same rule as `colorize`: a terminal gets the rich thing, anything redirected
+    gets plain text. Without it `check_ads_bib.sh ref.bib | less` and any CI step
+    would hang on a server nobody is going to open.
+    """
+    if args.no_review or args.replace:
+        return False
+    return args.review or interactive
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2207,7 +2224,7 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 1
     if args.replace:
         replace_outdated_entries(args.bibfile, results, args.token, args.timeout)
-    if args.review:
+    if wants_review(args, sys.stdout.isatty()):
         import review
 
         session = review.Review(

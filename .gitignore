@@ -5,6 +5,9 @@
 *.bib.bak
 *.bib.bak[0-9]*
 
+# Which entries you have looked at and accepted. Yours, and about your .bib.
+*.checked.json
+
 __pycache__/
 *.py[cod]
 docs/superpowers/specs/

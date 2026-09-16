@@ -11,6 +11,7 @@ file on disk has changed under the open tab.
 import json
 import sys
 import threading
+import time
 import webbrowser
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,19 @@ LOCK = threading.RLock()
 HTML = Path(__file__).resolve().parent / "review.html"
 MAX_BODY = 10_000_000
 ADS_FIELDS = ("title", "author", "year", "doi", "eprint")
+# An entry you have looked at and accepted stays accepted for as long as an ADS
+# response stays cached. Long enough not to be asked again while writing a paper.
+ACCEPTED_TTL = ads.DEFAULT_CACHE_TTL
+
+
+def accepted_path(path):
+    """Beside the .bib, like its backup: the pair travels together."""
+    return path.with_name(path.stem + ".checked.json")
+
+
+def fingerprint(entry):
+    """What was accepted, exactly. Edit the entry and the judgement no longer applies."""
+    return sha256(entry.raw.encode("utf-8")).hexdigest()
 
 
 class Review:
@@ -47,6 +61,53 @@ class Review:
         self.results = []
         self.backup = None
         self.replaced = 0
+        self.accepted, self.accepted_error = self._load_accepted()
+
+    def _load_accepted(self):
+        """Entries already reviewed and accepted, and why the file could not be read.
+
+        A damaged file is reported and then left alone: overwriting it is the one
+        way to lose the judgements it holds.
+        """
+        path = accepted_path(self.path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}, ""
+        except (OSError, ValueError) as exc:
+            return {}, f"Could not read {path.name} ({exc}); accepted entries are not being recorded."
+        accepted = data.get("accepted") if isinstance(data, dict) else None
+        if not isinstance(accepted, dict):
+            return {}, f"{path.name} is not in the expected shape; accepted entries are not being recorded."
+        return accepted, ""
+
+    def _save_accepted(self):
+        if self.accepted_error:
+            return
+        ads.write_text_atomically(
+            accepted_path(self.path),
+            json.dumps({"version": 1, "accepted": self.accepted}, indent=1, sort_keys=True) + "\n",
+        )
+
+    def is_accepted(self, entry):
+        record = self.accepted.get(entry.key)
+        if not isinstance(record, dict) or record.get("hash") != fingerprint(entry):
+            return False
+        at = record.get("at")
+        return isinstance(at, (int, float)) and time.time() - at <= ACCEPTED_TTL
+
+    def accept(self, key, accepted=True):
+        """Record, or withdraw, "I looked at this one and it is fine"."""
+        entry = self.entry_for(key)
+        if entry is None:
+            raise KeyError(f"no entry with key {key}")
+        if accepted:
+            status = next((r.status for e, r in self.results if e.key == key), "")
+            self.accepted[key] = {"hash": fingerprint(entry), "at": time.time(), "status": status}
+        else:
+            self.accepted.pop(key, None)
+        self._save_accepted()
+        return f"{key} {'accepted as correct' if accepted else 'put back in the queue'}"
 
     def revision(self):
         """Hash of the file the open tab is reviewing.
@@ -145,7 +206,8 @@ class Review:
             "notice": notice,
             "replaced": self.replaced,
             "backup": self.backup.name if self.backup else "",
-            "entries": [describe(entry, result) for entry, result in self.results]
+            "accepted_error": self.accepted_error,
+            "entries": [describe(entry, result, self.is_accepted(entry)) for entry, result in self.results]
             + [skipped_entry(entry) for entry in skipped],
             "counts": ads.ordered_counts(counts),
             "skipped": len(skipped),
@@ -156,7 +218,7 @@ class Review:
         }
 
 
-def describe(entry, result):
+def describe(entry, result, accepted=False):
     """Everything the CLI prints about one entry, plus what it only computes and drops."""
     ads_entry = ads.parsed_ads_entry(entry, result.ads_bibtex) if result.ads_bibtex else None
     conflicts = ads.identity_conflicts(entry, ads_entry) if ads_entry else []
@@ -196,6 +258,7 @@ def describe(entry, result):
         "auto": bool(candidate) and ads_entry is not None and not conflicts,
         "manual": result.status in ads.MANUAL_REPLACEMENT_STATUSES,
         "issueish": result.status in ads.ISSUE_STATUSES,
+        "accepted": accepted,
         "skip": False,
     }
 
@@ -222,6 +285,7 @@ def skipped_entry(entry):
         "auto": False,
         "manual": False,
         "issueish": False,
+        "accepted": False,
         "skip": True,
     }
 
@@ -329,7 +393,7 @@ def handler_for(review):
 
         def _post(self):
             url = urlsplit(self.path)
-            if url.path not in {"/api/replace", "/api/recheck"}:
+            if url.path not in {"/api/replace", "/api/recheck", "/api/accept"}:
                 return self._send(404, "not found", "text/plain")
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
                 return self._error(400, "expected Content-Type: application/json")
@@ -353,6 +417,13 @@ def handler_for(review):
 
             if self.headers.get("If-Match") != review.revision():
                 return self._error(409, "The .bib changed since this tab loaded it. Reload, then retry the edit.")
+
+            if url.path == "/api/accept":
+                key = body.get("key")
+                if not isinstance(key, str):
+                    return self._error(400, "accept needs a key")
+                return self._state(review.accept(key, bool(body.get("accepted", True))))
+
             key = body.get("key")
             bibtex = body.get("bibtex")
             if not isinstance(key, str) or not isinstance(bibtex, str) or not bibtex.strip():

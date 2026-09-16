@@ -316,6 +316,81 @@ def test_an_unreadable_tex_file_is_reported_not_raised():
         assert len(payload["unreadable"]) == 1 and "gone.tex" in payload["unreadable"][0]
 
 
+def test_accepting_an_entry_outlives_the_tab():
+    """The point of the file: a decision must not die when the browser closes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        base, get, post, stop = serving(item)
+        try:
+            payload = post("/api/accept", {"key": "Smith2020", "accepted": True})
+        finally:
+            stop()
+        smith = {e["key"]: e for e in payload["entries"]}["Smith2020"]
+        assert smith["accepted"] is True and smith["issueish"] is True, "still an issue, just not an open one"
+        assert review.accepted_path(item.path).exists()
+
+        # A fresh session on the same file, as if the tool were re-run tomorrow.
+        again = session(tmp, MISMATCH)
+        assert again.is_accepted(again.entries[0]), "the acceptance did not survive a restart"
+        assert again.accepted_error == ""
+
+
+def test_editing_an_accepted_entry_raises_it_again():
+    """The judgement was about that text. Change the text and it no longer applies."""
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        item.accept("Smith2020")
+        assert item.is_accepted(item.entries[0])
+        item.path.write_text(BIB.replace("A study of galaxies", "A different study entirely"))
+        item.refresh()
+        assert not item.is_accepted(item.entries[0]), "an edited entry must come back to the queue"
+
+
+def test_an_acceptance_can_be_withdrawn():
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        item.accept("Smith2020")
+        item.accept("Smith2020", accepted=False)
+        assert not item.is_accepted(item.entries[0])
+        assert json.loads(review.accepted_path(item.path).read_text())["accepted"] == {}
+
+
+def test_an_acceptance_expires():
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        item.accept("Smith2020")
+        item.accepted["Smith2020"]["at"] -= review.ACCEPTED_TTL + 1
+        assert not item.is_accepted(item.entries[0]), "a stale acceptance must be re-asked"
+
+
+def test_a_damaged_checked_file_is_reported_not_overwritten():
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        path = review.accepted_path(item.path)
+        path.write_text("{not json")
+        again = session(tmp, MISMATCH)
+        assert again.accepted_error and "checked.json" in again.accepted_error
+        assert again.payload()["accepted_error"] == again.accepted_error, "the page has to say so"
+        again.accept("Smith2020")
+        assert path.read_text() == "{not json", "a file that could not be read must not be replaced"
+
+
+def test_accepting_an_unknown_key_is_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        base, get, post, stop = serving(item)
+        try:
+            for body, code in (({"key": "Nope2020"}, 400), ({}, 400)):
+                try:
+                    post("/api/accept", body)
+                except HTTPError as exc:
+                    assert exc.code == code, (body, exc.code)
+                else:
+                    assert False, f"accepted {body}"
+        finally:
+            stop()
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:
