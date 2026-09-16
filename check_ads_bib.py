@@ -61,6 +61,7 @@ MISS_TTL = 60 * 60
 # One export request carries many bibcodes; ADS allows far more than this.
 EXPORT_BATCH = 100
 BIBCODE_RE = re.compile(r"/abs/([^/?#]+)")
+BLOCK_RE = re.compile(r"@(?P<kind>[A-Za-z]+)\s*{", re.M)
 ENTRY_RE = re.compile(r"@(?P<kind>[A-Za-z]+)\s*{\s*(?P<key>[^,\s]+)\s*,", re.M)
 FIELD_RE = re.compile(r"(?P<name>[A-Za-z][A-Za-z0-9_-]*)\s*=", re.M)
 SKIP_DIRECTIVE_RE = re.compile(r"^\s*%+\s*checkcitation:\s*skip\b", re.I)
@@ -467,15 +468,18 @@ def find_entry_end(text: str, start: int) -> int:
 def parse_bibtex_text(text: str) -> list[BibEntry]:
     entries: list[BibEntry] = []
     consumed = 0
-    for match in ENTRY_RE.finditer(text):
+    for block in BLOCK_RE.finditer(text):
         # Anything inside a block already consumed is not a top-level entry. That
         # is what keeps `@comment{@ARTICLE{...}}` disabled instead of parsing the
         # inner entry, sending it to ADS, and rewriting the comment in place.
-        if match.start() < consumed:
+        if block.start() < consumed:
             continue
-        kind = match.group("kind").lower()
+        kind = block.group("kind").lower()
+        match = ENTRY_RE.match(text, block.start())
+        if kind not in NON_ENTRY_KINDS and match is None:
+            continue
         try:
-            end = find_entry_end(text, match.start())
+            end = find_entry_end(text, block.start())
         except ValueError as exc:
             if kind in NON_ENTRY_KINDS:
                 continue
@@ -549,7 +553,7 @@ def bare_doi(value: str) -> str:
 
 def bare_arxiv(value: str) -> str:
     """An arXiv id without its `arXiv:` prefix, in whatever case it was written."""
-    return ARXIV_PREFIX_RE.sub("", value.strip(), count=1)
+    return ARXIV_VERSION_RE.sub("", ARXIV_PREFIX_RE.sub("", value.strip(), count=1))
 
 
 def candidate_queries(entry: BibEntry, include_bibcode: bool = True) -> list[tuple[str, str]]:
@@ -1195,7 +1199,7 @@ def verify_ads_bibtex(
         return AdsResult("ERROR", result.query, result.matches, f"could not parse ADS BibTeX for {bibcode}")
 
     conflicts = identity_conflicts(entry, ads_entry)
-    if conflicts == ["key"]:
+    if conflicts == ["key"] and bibtex_matches_ads(entry, ads_entry):
         # The entry matches the record; only its key does not. Replacement cannot
         # help - the key is kept by design - so this must not be offered as one.
         return AdsResult(
@@ -1602,6 +1606,16 @@ def replace_bibtex_key(bibtex: str, key: str) -> str:
     return ENTRY_RE.sub(lambda match: f"@{match.group('kind')}{{{key},", bibtex, count=1)
 
 
+def validated_replacement(bibtex: str, key: str) -> str:
+    replacement = replace_bibtex_key(bibtex.strip(), key)
+    parsed = parse_bibtex_text(replacement)
+    if len(parsed) != 1:
+        raise ValueError(f"replacement must be exactly one BibTeX entry, not {len(parsed)}")
+    if parsed[0].key != key:
+        raise ValueError(f"the replacement would rename {key} to {parsed[0].key}; remove any @comment or @string before the entry")
+    return replacement
+
+
 def latest_bibcode_for_result(result: AdsResult) -> str | None:
     if result.status in {"ADS_BIBTEX_MISMATCH", "NON_ADS_BIBTEX"} and result.matches:
         return str(result.matches[0].get("bibcode", "")) or None
@@ -1809,6 +1823,15 @@ def write_text_atomically(path: Path, text: str) -> None:
         raise
 
 
+def write_replacements(path: Path, text: str, replacements: list[tuple[BibEntry, str]], backup: Path | None) -> Path:
+    """Refuse a snapshot changed while the user was reviewing it."""
+    if path.read_text(encoding="utf-8") != text:
+        raise ValueError("the .bib changed on disk; reload before writing")
+    backup = ensure_backup(path, backup)
+    write_text_atomically(path, apply_replacements(text, replacements))
+    return backup
+
+
 def replace_outdated_entries(
     bibfile: Path,
     results: list[tuple[BibEntry, AdsResult]],
@@ -1917,9 +1940,11 @@ def replace_outdated_entries(
             continue
 
         if choice == "ads" and ads_replacement is not None:
-            backup_path = ensure_backup(bibfile, backup_path)
-            original_text = apply_replacements(original_text, [(current_entry, ads_replacement)])
-            write_text_atomically(bibfile, original_text)
+            try:
+                backup_path = write_replacements(bibfile, original_text, [(current_entry, ads_replacement)], backup_path)
+            except ValueError as exc:
+                print(f"Skipping {current_entry.key}: {exc}")
+                continue
             replacement_count += 1
             print(f"Updated {current_entry.key} in {bibfile}.")
             continue
@@ -1939,7 +1964,11 @@ def replace_outdated_entries(
                 print(f"Expected exactly one BibTeX entry, got {len(pasted_entries)}.")
                 continue
 
-            replacement = replace_bibtex_key(pasted, current_entry.key)
+            try:
+                replacement = validated_replacement(pasted, current_entry.key)
+            except ValueError as exc:
+                print(f"Could not use pasted BibTeX: {exc}")
+                continue
             print_bibtex_block("Pasted Replacement", replacement)
             print("\n" + "-" * 100)
             manual_choice = prompt_manual_replacement_choice(current_entry.key)
@@ -1949,9 +1978,11 @@ def replace_outdated_entries(
                 print(f"Skipped {current_entry.key}.")
                 break
 
-            backup_path = ensure_backup(bibfile, backup_path)
-            original_text = apply_replacements(original_text, [(current_entry, replacement)])
-            write_text_atomically(bibfile, original_text)
+            try:
+                backup_path = write_replacements(bibfile, original_text, [(current_entry, replacement)], backup_path)
+            except ValueError as exc:
+                print(f"Skipping {current_entry.key}: {exc}")
+                break
             replacement_count += 1
             print(f"Updated {current_entry.key} in {bibfile}.")
             break

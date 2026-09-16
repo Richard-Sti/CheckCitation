@@ -345,7 +345,8 @@ def test_editing_an_accepted_entry_raises_it_again():
         item.accept("Smith2020")
         assert item.is_accepted(item.entries[0])
         item.path.write_text(BIB.replace("A study of galaxies", "A different study entirely"))
-        item.refresh()
+        with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+            item.refresh()
         assert not item.is_accepted(item.entries[0]), "an edited entry must come back to the queue"
 
 
@@ -439,7 +440,8 @@ def test_replacing_an_entry_never_puts_it_straight_back_in_the_queue():
         assert payload["accepted"] is True
         # And the acceptance is about the new text, so a later edit re-opens it.
         item.path.write_text(item.path.read_text().replace("A study of galaxies", "Something else"))
-        item.refresh()
+        with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+            item.refresh()
         assert not item.is_accepted(next(e for e in item.entries if e.key == "Smith2020"))
 
 
@@ -577,7 +579,8 @@ def test_a_commit_writes_every_staged_edit_in_one_pass():
         base, get, post, stop = serving(item)
         try:
             with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
-                payload = post("/api/commit", {"edits": {"Smith2020": ADS_EXPORT, "Jones2019": jones}})
+                payload = post("/api/commit", {"edits": {"Smith2020": ADS_EXPORT, "Jones2019": jones},
+                                                    "originals": {e.key: e.raw for e in item.entries}})
         finally:
             stop()
         text = item.path.read_text()
@@ -603,7 +606,7 @@ def test_one_bad_edit_writes_none_of_them():
                 {},                                                                       # nothing staged
             ):
                 try:
-                    post("/api/commit", {"edits": edits})
+                    post("/api/commit", {"edits": edits, "originals": {k: item.entry_for(k).raw if item.entry_for(k) else "" for k in edits}})
                 except HTTPError as exc:
                     assert exc.code == 400, (edits, exc.code)
                 else:
@@ -633,10 +636,36 @@ def test_a_stale_tab_cannot_commit():
             stop()
 
 
+def test_reloading_cannot_authorise_an_old_staged_replacement():
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        originals = {e.key: e.raw for e in item.entries}
+        item.path.write_text(BIB.replace("A study of galaxies", "An editor correction"))
+        before = item.path.read_bytes()
+        base, get, post, stop = serving(item)
+        try:
+            with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+                revision = get("/api/state")["revision"]
+                for bases in (None, originals):
+                    try:
+                        post("/api/commit", {"edits": {"Smith2020": ADS_EXPORT, "Jones2019": ADS_EXPORT},
+                                             "originals": bases}, revision=revision)
+                    except HTTPError as exc:
+                        assert exc.code == 400
+                    else:
+                        assert False, "a reload authorised an old stage"
+                    assert item.path.read_bytes() == before
+            assert not list(item.path.parent.glob("*.bak*"))
+        finally:
+            stop()
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:
-        test()
+        with patch.object(check_ads_bib.urllib.request, "urlopen", side_effect=AssertionError("unexpected external request")) as network:
+            test()
+            assert not network.called, f"{test.__name__} attempted an external request"
         print(f"ok   {test.__name__}")
     print(f"\n{len(tests)} passed")
 

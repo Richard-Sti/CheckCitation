@@ -764,6 +764,68 @@ def test_a_key_only_disagreement_is_not_a_replacement():
     assert check_ads_bib.ads_replacement_bibcode(other) == "2011arXiv1111.4246H"
 
 
+def test_review_regressions_in_parsing_and_identifiers():
+    raw = "@ARTICLE{Smith2020, title={Original}, author={Smith, J.}, year={2020}}"
+    for prefix in ("Disabled entry follows:", "\nNotes before the entry\n"):
+        assert parse_bibtex_text("@comment{" + prefix + raw + "}") == []
+    assert parse_bibtex_text("@comment{Disabled: " + raw + "}\n" + raw)[0].key == "Smith2020"
+    local = entry("@ARTICLE{Smith2020, eprint={arXiv:2001.00001v2}}")
+    assert 'v2' not in combined_identifier_query(local)
+    assert 'v2' not in candidate_queries(local)[0][1]
+    with patch.object(check_ads_bib, "ads_search", return_value=[{
+        "bibcode": "X", "identifier": ["arXiv:2001.00001"],
+    }]):
+        assert identifier_consensus(local, "token", 5, 1, 0).status == "OK"
+
+
+def test_a_key_conflict_does_not_hide_other_field_changes():
+    local = entry("@ARTICLE{Jones2020, author={Smith, J.}, title={Same title}, year={2020}, volume={999}}")
+    export = "@ARTICLE{X, author={Smith, J.}, title={Same title}, year={2020}, volume={10}}"
+    with patch.object(check_ads_bib, "ads_export_bibtex", return_value=export):
+        result = check_ads_bib.verify_ads_bibtex(local, "X", AdsResult("OK", "", [{"bibcode": "X"}]), "token", 1)
+    assert result.status == "ADS_RECORD_CONFLICT"
+    assert check_ads_bib.ads_replacement_bibcode(result) == "X"
+
+
+def test_cli_preserves_edits_saved_during_either_prompt():
+    from contextlib import redirect_stdout
+    from io import StringIO
+    raw = "@ARTICLE{Smith2020, title={Original}, author={Smith, J.}, year={2020}}"
+    exported = raw[:-1] + ", volume={10}}"
+    result = AdsResult("ADS_BIBTEX_MISMATCH", "", [{"bibcode": "X"}], ads_bibtex=exported)
+    for manual in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ref.bib"
+            path.write_text(raw)
+            changed = raw + "\n% saved while the prompt was open\n"
+            def choose(*args):
+                path.write_text(changed)
+                return "replace" if manual else "ads"
+            with patch.object(check_ads_bib, "prompt_replacement_session", return_value=True), \
+                 patch.object(check_ads_bib, "prompt_replacement_choice", side_effect=(lambda *a: "manual") if manual else choose), \
+                 patch.object(check_ads_bib, "prompt_manual_bibtex", return_value=exported), \
+                 patch.object(check_ads_bib, "prompt_manual_replacement_choice", side_effect=choose), redirect_stdout(StringIO()):
+                assert check_ads_bib.replace_outdated_entries(path, [(entry(raw), result)], "token", 1) == 0
+            assert path.read_text() == changed
+            assert not list(Path(tmp).glob("*.bak*"))
+
+
+def test_cli_rejects_a_manual_paste_that_would_rename_the_key():
+    from contextlib import redirect_stdout
+    from io import StringIO
+    raw = "@ARTICLE{Smith2020, title={Original}}"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "ref.bib"
+        path.write_text(raw)
+        with patch.object(check_ads_bib, "prompt_replacement_session", return_value=True), \
+             patch.object(check_ads_bib, "prompt_replacement_choice", return_value="manual"), \
+             patch.object(check_ads_bib, "prompt_manual_bibtex", side_effect=["@comment{note,}\n@ARTICLE{Other, title={T}}", None]), \
+             patch.object(check_ads_bib, "prompt_manual_replacement_choice") as confirm, redirect_stdout(StringIO()):
+            assert check_ads_bib.replace_outdated_entries(path, [(entry(raw), AdsResult("MISSING", "", []))], "token", 1) == 0
+        assert path.read_text() == raw
+        assert not confirm.called
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

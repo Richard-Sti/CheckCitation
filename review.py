@@ -213,23 +213,14 @@ class Review:
         entry = self.entry_for(key)
         if entry is None:
             raise KeyError(f"no entry with key {key}")
-        replacement = ads.replace_bibtex_key(str(bibtex).strip(), key)
-        parsed = ads.parse_bibtex_text(replacement)
-        if len(parsed) != 1:
-            raise ValueError(f"{key}: a replacement must be exactly one BibTeX entry, not {len(parsed)}")
-        # replace_bibtex_key rewrites the first `@kind{key,` it sees, which may be a
-        # `@comment{...}` wrapper that parsing then drops - leaving the real entry
-        # under the pasted key and every cite to it broken.
-        if parsed[0].key != key:
-            raise ValueError(
-                f"{key}: the replacement would rename it to {parsed[0].key}; "
-                "remove any @comment or @string before the entry"
-            )
+        if not isinstance(bibtex, str):
+            raise ValueError(f"{key}: replacement must be a BibTeX string")
+        replacement = ads.validated_replacement(bibtex, key)
         if text[entry.start : entry.end] != entry.raw:
             raise ValueError("the .bib changed on disk; reload before writing")
         return entry, replacement
 
-    def commit(self, edits):
+    def commit(self, edits, originals=None):
         """Write every staged edit in one backup and one atomic write.
 
         All or nothing: one bad edit writes none of them, so the file is never left
@@ -237,10 +228,14 @@ class Review:
         """
         if not isinstance(edits, dict) or not edits:
             raise ValueError("there is nothing staged to write")
+        if not isinstance(originals, dict) or set(originals) != set(edits):
+            raise ValueError("staged edits need their original text; unstage and review them again")
         text = self.path.read_text(encoding="utf-8")
         pending = [self._prepare(text, key, bibtex) for key, bibtex in edits.items()]
-        self.backup = ads.ensure_backup(self.path, self.backup)
-        ads.write_text_atomically(self.path, ads.apply_replacements(text, pending))
+        for entry, _ in pending:
+            if originals[entry.key] != entry.raw:
+                raise ValueError(f"{entry.key} changed since it was staged; unstage and review it again")
+        self.backup = ads.write_replacements(self.path, text, pending, self.backup)
         self.replaced += len(pending)
         self.refresh(recheck=set(edits))
         # Acting on an entry settles it: if ADS still disagrees after the rewrite it
@@ -266,26 +261,9 @@ class Review:
         replacement, so it must also withdraw the acceptance the replacement made,
         or the entry would be silently suppressed in the state you just restored.
         """
-        entry = self.entry_for(key)
-        if entry is None:
-            raise KeyError(f"no entry with key {key}")
-        replacement = ads.replace_bibtex_key(bibtex.strip(), key)
-        parsed = ads.parse_bibtex_text(replacement)
-        if len(parsed) != 1:
-            raise ValueError(f"replacement must be exactly one BibTeX entry, not {len(parsed)}")
-        # replace_bibtex_key rewrites the first `@kind{key,` it sees, which may be a
-        # `@comment{...}` wrapper that parsing then drops - leaving the real entry
-        # under the pasted key and every \cite{} to it broken.
-        if parsed[0].key != key:
-            raise ValueError(
-                f"the replacement would rename {key} to {parsed[0].key}; "
-                "remove any @comment or @string before the entry"
-            )
         text = self.path.read_text(encoding="utf-8")
-        if text[entry.start : entry.end] != entry.raw:
-            raise ValueError("the .bib changed on disk; reload before applying edits")
-        self.backup = ads.ensure_backup(self.path, self.backup)
-        ads.write_text_atomically(self.path, ads.apply_replacements(text, [(entry, replacement)]))
+        pending = self._prepare(text, key, bibtex)
+        self.backup = ads.write_replacements(self.path, text, [pending], self.backup)
         self.replaced += 1
         self.refresh(recheck={key})
         # You have acted on this entry. If ADS still disagrees after the rewrite,
@@ -546,7 +524,7 @@ def handler_for(review):
                 return self._error(409, "The .bib changed since this tab loaded it. Reload, then retry the edit.")
 
             if url.path == "/api/commit":
-                return self._state(review.commit(body.get("edits")))
+                return self._state(review.commit(body.get("edits"), body.get("originals")))
 
             if url.path == "/api/clear":
                 return self._state(review.clear_accepted())

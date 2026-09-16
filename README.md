@@ -133,7 +133,10 @@ makes a single atomic write, and it is all-or-nothing: if any staged edit no lon
 applies, none of them are written, so the file is never left holding half a review.
 
 Staged edits are kept in the browser against the bibliography's full path, so
-closing the tab does not lose them, and `Unstage` takes one back off the pile.
+closing the tab does not lose them, and `Unstage` restores the replacement as an editable draft.
+Each staged edit retains the original entry text, which is checked again when writing even after a reload.
+If that entry changed, unstage it and review the draft against the updated entry before staging it again.
+Stages saved by older versions have no original text and also require this review.
 Marking an entry **checked** is not a file edit and still saves immediately — that
 store exists precisely so a judgement survives a restart.
 

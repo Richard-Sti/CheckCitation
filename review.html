@@ -224,7 +224,7 @@ function queueKeys(entries, deferred, focus, staged = {}) {
   const open = entries
     .filter(e => e.issueish && !staged[e.key] && (!e.accepted || focus.includes(e.key)))
     .map(e => e.key);
-  const rank = key => focus.includes(key) ? 0 : deferred.includes(key) ? 2 : 1;
+  const rank = key => focus.includes(key) ? 0 : deferred.includes(key) ? 2 + deferred.indexOf(key) : 1;
   return open.slice().sort((a, b) => rank(a) - rank(b));
 }
 
@@ -313,6 +313,7 @@ let entries = [], counts = [], dupes = [], warns = [], tex = null;
 let revision = null, replaced = 0, skipped = 0, source = '';
 let deferred = [], focus = [], history = [], acceptedError = '';
 let filePath = '';
+let originals = {};
 let drafts = {}, staged = {}, fetchedAuto = {}, vetted = {}, blockedDrafts = false;
 let busy = false, stale = false, filter = 'all', confirming = null;
 let requestQueue = Promise.resolve();
@@ -327,12 +328,16 @@ function readDrafts() {
   try {
     drafts = JSON.parse(localStorage.getItem(draftKey()) || '{}') || {};
     if (typeof drafts !== 'object') drafts = {};
-    staged = JSON.parse(localStorage.getItem(stagedKey()) || '{}') || {};
-    if (typeof staged !== 'object') staged = {};
+    const saved = JSON.parse(localStorage.getItem(stagedKey()) || '{}') || {};
+    // Legacy stages have no base text. Keep them available to unstage and review.
+    staged = saved.version === 1 ? saved.edits : saved;
+    originals = saved.version === 1 ? saved.originals : {};
+    if (!staged || typeof staged !== 'object' || !originals || typeof originals !== 'object')
+      throw new Error('Invalid saved stages');
   } catch (e) {
     // Damaged storage is left exactly as it is; overwriting it is the one way
     // to lose a pasted replacement for good.
-    drafts = {}; staged = {}; blockedDrafts = true;
+    drafts = {}; staged = {}; originals = {}; blockedDrafts = true;
   }
 }
 
@@ -341,7 +346,7 @@ function persistDrafts() {
   try {
     localStorage.setItem(draftKey(), JSON.stringify(drafts));
     // Staged edits outlive the tab too, so closing it cannot lose a review.
-    localStorage.setItem(stagedKey(), JSON.stringify(staged));
+    localStorage.setItem(stagedKey(), JSON.stringify({version: 1, edits: staged, originals}));
   } catch (e) { blockedDrafts = true; }
 }
 
@@ -467,7 +472,9 @@ function stage(key, bibtex) {
     note(`${key} already matches ADS, so there is nothing to stage. Whatever ADS disagrees with is not in the entry body.`, true);
     return;
   }
+  if (!entry) return;
   staged[key] = bibtex;
+  originals[key] = entry.raw;
   delete drafts[key];
   focus = focus.filter(k => k !== key);
   confirming = null;
@@ -477,7 +484,9 @@ function stage(key, bibtex) {
 }
 
 function unstage(key) {
+  if (staged[key] !== undefined) drafts[key] = staged[key];
   delete staged[key];
+  delete originals[key];
   persistDrafts();
   note(`${key} unstaged.`);
   render();
@@ -489,12 +498,17 @@ async function writeAll() {
   busy = true;
   note(`Writing ${keys.length} change${keys.length === 1 ? '' : 's'} to ${source}…`);
   try {
-    const edits = {};
-    keys.forEach(key => { edits[key] = staged[key]; });
-    const res = await apiFetch('/api/commit', {method: 'POST', body: JSON.stringify({edits})});
+    const edits = {}, bases = {};
+    keys.forEach(key => {
+      if (originals[key] !== byKey(entries, key).raw)
+        throw new Error(`${key} changed since it was staged or has no saved original. Unstage and review it again.`);
+      edits[key] = staged[key];
+      bases[key] = originals[key];
+    });
+    const res = await apiFetch('/api/commit', {method: 'POST', body: JSON.stringify({edits, originals: bases})});
     if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
     // Only once the server has them: a refused write keeps every staged edit.
-    keys.forEach(key => { history.unshift({key, raw: byKey(entries, key).raw}); delete staged[key]; });
+    keys.forEach(key => { history.unshift({key, raw: byKey(entries, key).raw}); delete staged[key]; delete originals[key]; });
     persistDrafts();
     adopt(res.body);
     note(acceptedError || res.body.notice || '', !!acceptedError);

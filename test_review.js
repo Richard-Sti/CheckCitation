@@ -293,6 +293,7 @@ function entry(over = {}) {
   call('unstage', 'B2019');
   assert.deepEqual(read('stagedKeys(staged, entries)'), ['A2020'], 'unstaging takes it back off the pile');
 
+  set('originals = Object.fromEntries(entries.map(e => [e.key, e.raw]));');
   await read('writeAll()');
   assert.deepEqual(sent.map(s => s.url), ['/api/commit'], 'one request writes everything');
   assert.deepEqual(Object.keys(sent[0].body.edits), ['A2020']);
@@ -309,6 +310,7 @@ function entry(over = {}) {
   const rows = [entry({key: 'A2020', auto: true, raw: '@ARTICLE{A2020, title = {old}}'})];
   set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; filePath = '/p/ref.bib'; revision = 'r1'; busy = false;`);
   set("deferred = []; focus = []; drafts = {}; staged = {A2020: '@ARTICLE{A2020, title = {new}}'}; fetchedAuto = {}; vetted = {}; history = []; blockedDrafts = true;");
+  set('originals = Object.fromEntries(entries.map(e => [e.key, e.raw]));');
   await read('writeAll()');
   assert.deepEqual(read('stagedKeys(staged, entries)'), ['A2020'], 'a refused write must not lose the review');
   assert.deepEqual(read('history'), [], 'and must not claim anything was written');
@@ -568,3 +570,39 @@ function entry(over = {}) {
   assert.equal(nodes['n-check'].textContent, 3, 'the tab badge counts duplicates, warnings and undefined keys');
   console.log('ok: a full render covers every cross-check section');
 }
+
+/* ---- review regressions: defer order, editable unstaging, and stale stages ---- */
+(async () => {
+  const stored = {};
+  let requests = 0;
+  const {read, call, set, nodes} = page({
+    localStorage: {getItem: k => stored[k] ?? null, setItem: (k, v) => { stored[k] = v; }},
+    fetch: async () => { requests++; throw new Error('unexpected write'); },
+  });
+  const rows = [entry({key: 'A'}), entry({key: 'B'})];
+  set(`entries = ${JSON.stringify(rows)}; filePath = '/paper/ref.bib';`);
+  call('act', 'defer'); call('act', 'defer'); call('act', 'defer');
+  assert.deepEqual(read('queueKeys(entries, deferred, focus, staged)'), ['B', 'A']);
+  const pasted = '@ARTICLE{A, title={Carefully edited replacement}}';
+  call('stage', 'A', pasted);
+  call('unstage', 'A');
+  assert.equal(read('drafts.A'), pasted);
+  call('readDrafts');
+  assert.equal(read('drafts.A'), pasted, 'unstaged text survives reopening');
+  call('stage', 'A', pasted);
+  call('readDrafts');
+  assert.equal(read('originals.A'), rows[0].raw);
+  set('entries[0].raw = "@ARTICLE{A, title={External correction}}"; revision = "new";');
+  await read('writeAll()');
+  assert.equal(requests, 0);
+  assert.match(nodes.note.textContent, /Unstage and review/);
+  assert.equal(read('staged.A'), pasted);
+  // Older saved stages have no original: retain the text, require another review.
+  stored['ads-review-staged:/paper/ref.bib'] = JSON.stringify({A: pasted});
+  call('readDrafts');
+  await read('writeAll()');
+  assert.equal(requests, 0);
+  call('unstage', 'A');
+  assert.equal(read('drafts.A'), pasted);
+  console.log('ok: defer cycles, unstage preserves text, and reload never authorises stale stages');
+})().catch(e => { console.error(e); process.exitCode = 1; });
