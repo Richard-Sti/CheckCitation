@@ -460,6 +460,13 @@ async function replace(key, bibtex, undo = false) {
 // Staging is a decision, not a write: nothing touches the .bib until Write.
 function stage(key, bibtex) {
   if (!bibtex || !bibtex.trim()) return;
+  // One guard for the button, the confirm and the keyboard alike: staging text
+  // the entry already holds would write the same bytes and settle nothing.
+  const entry = byKey(entries, key);
+  if (entry && bibtex.trim() === entry.raw.trim()) {
+    note(`${key} already matches ADS, so there is nothing to stage. Whatever ADS disagrees with is not in the entry body.`, true);
+    return;
+  }
   staged[key] = bibtex;
   delete drafts[key];
   focus = focus.filter(k => k !== key);
@@ -580,6 +587,8 @@ function stats() {
 function cardBody(entry) {
   const draft = drafts[entry.key] ?? entry.ads_bibtex ?? '';
   const risky = !isVetted(entry, drafts, fetchedAuto, vetted);
+  // Staging the proposal when it already is the entry would write the same bytes.
+  const canStage = !!draft.trim() && !(entry.identical && draft.trim() === (entry.ads_bibtex || '').trim());
   const canFetch = !entry.ads_bibtex && entry.candidate && !drafts[entry.key];
   return `<div class="card">
     <h2>${esc(entry.key)}</h2>
@@ -604,9 +613,12 @@ function cardBody(entry) {
     <textarea id="bibtex" data-draft="${esc(entry.key)}" spellcheck="false"
       placeholder="Paste the BibTeX you want here. The key ${esc(entry.key)} is kept whatever the pasted key says.">${esc(draft)}</textarea>
     <div class="actions">
-      <button class="btn ${risky ? 'danger' : 'good'}" data-apply="${esc(entry.key)}"
-        ${draft.trim() && !(entry.identical && draft.trim() === (entry.ads_bibtex || '').trim()) ? '' : 'disabled'}>
-        ${risky ? 'Stage it anyway…' : 'Stage replacement'}</button>
+      <button class="btn ${risky ? 'danger' : 'good'}" data-apply="${esc(entry.key)}" ${canStage ? '' : 'disabled'}
+        title="${canStage ? '' : esc(entry.identical
+          ? 'The proposal already is this entry. Paste a different record to stage one.'
+          : 'Nothing to stage yet: fetch the ADS export or paste a replacement.')}">
+        ${canStage ? (risky ? 'Stage it anyway…' : 'Stage replacement')
+          : entry.identical ? 'Nothing to stage — already matches ADS' : 'Nothing to stage yet'}</button>
       <button class="btn" data-keep="${esc(entry.key)}">Checked, it is fine</button>
       <button class="btn" data-defer="${esc(entry.key)}">Defer</button>
       ${history.length ? `<button class="btn" data-undo="0">Undo ${esc(history[0].key)}</button>` : ''}
@@ -615,7 +627,9 @@ function cardBody(entry) {
       This may be a different paper, not a formatting refresh. Replace <code>${esc(entry.key)}</code>?
       <button class="btn danger" data-confirm="${esc(entry.key)}">Yes, replace</button>
       <button class="btn" data-cancel="1">Cancel</button></div>` : ''}
-    <p class="keys">${risky
+    <p class="keys">${!canStage
+      ? '← / h checked and fine · space defer. There is nothing here to stage.'
+      : risky
       ? '← / h checked and fine · space defer. A risky replacement needs the button. Nothing is written until you click Write.'
       : '→ / l stage · ← / h checked and fine · space defer. Nothing is written until you click Write.'}</p>
   </div>`;

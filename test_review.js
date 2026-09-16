@@ -377,6 +377,31 @@ function entry(over = {}) {
   console.log('ok: a replacement that would rewrite the same bytes is not offered');
 }
 
+/* ---- an entry that already matches ADS cannot be staged, by any route ---- */
+(async () => {
+  const sent = [];
+  const {nodes, read, call, set} = page({
+    fetch: async (url, options = {}) => { sent.push({url, body: JSON.parse(options.body)}); return {ok: true, status: 200, json: async () => ({})}; },
+  });
+  const raw = '@software{Bradbury2021,\n  title = {JAX}\n}';
+  const rows = [entry({key: 'Bradbury2021', raw, ads_bibtex: raw, identical: true,
+                       status: 'IDENTIFIER_MISMATCH', conflicts: [], auto: true})];
+  set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; filePath = '/p/ref.bib'; revision = 'r1'; busy = false;`);
+  set("deferred = []; focus = []; drafts = {}; staged = {}; fetchedAuto = {}; vetted = {}; history = []; confirming = null; blockedDrafts = true;");
+
+  const card = call('cardBody', rows[0]);
+  assert.match(card, /Nothing to stage — already matches ADS/, 'the button has to say why it is dead');
+  assert.match(card, /data-apply="Bradbury2021"\s+disabled/);
+  assert.ok(!card.includes('l stage'), 'and the keys line must not advertise a key that will not work');
+
+  // The keyboard goes through the same guard as the button.
+  call('act', 'replace');
+  assert.deepEqual(read('staged'), {}, 'the stage key must not bypass the disabled button');
+  assert.match(nodes.note.textContent, /already matches ADS/);
+  assert.equal(sent.length, 0);
+  console.log('ok: an entry that already matches ADS cannot be staged by button or key');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+
 /* ---- the handoff, for entries no route resolved ---- */
 {
   const {call} = page();
