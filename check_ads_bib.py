@@ -44,13 +44,22 @@ def colorize(text: str, code: str) -> str:
 
 ADS_API = "https://api.adsabs.harvard.edu/v1/search/query"
 ADS_BIBTEX_API = "https://api.adsabs.harvard.edu/v1/export/bibtex"
+# ADS's own citation matcher: it takes a reference string built from author,
+# year, journal, volume and page - the coordinates a Solr query never uses.
+ADS_REFERENCE_API = "https://api.adsabs.harvard.edu/v1/reference/text"
+ADS_UI = "https://ui.adsabs.harvard.edu"
 DEFAULT_JOBS = 1
 DEFAULT_SLEEP = 0.1
 DEFAULT_RETRIES = 4
 DEFAULT_RETRY_WAIT = 10.0
 MAX_RETRY_WAIT = 60.0
 DEFAULT_CACHE_PATH = Path(__file__).with_name(".ads_cache.json")
-DEFAULT_CACHE_TTL = 24 * 60 * 60
+DEFAULT_CACHE_TTL = 30 * 24 * 60 * 60
+# A resolved ADS record does not change, but a miss stops being a miss the
+# moment ADS indexes the paper. Same cache, two expiries.
+MISS_TTL = 60 * 60
+# One export request carries many bibcodes; ADS allows far more than this.
+EXPORT_BATCH = 100
 BIBCODE_RE = re.compile(r"/abs/([^/?#]+)")
 ENTRY_RE = re.compile(r"@(?P<kind>[A-Za-z]+)\s*{\s*(?P<key>[^,\s]+)\s*,", re.M)
 FIELD_RE = re.compile(r"(?P<name>[A-Za-z][A-Za-z0-9_-]*)\s*=", re.M)
@@ -58,12 +67,33 @@ SKIP_DIRECTIVE_RE = re.compile(r"^\s*%+\s*checkcitation:\s*skip\b", re.I)
 LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+\s*")
 NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
 AUTHOR_SPLIT_RE = re.compile(r"\s+and\s+", re.I)
+# "1105--1134" cites page 1105; "A6" is already the whole locator.
+FIRST_PAGE_RE = re.compile(r"^[A-Za-z]?\d+")
+# `0.8 2020A&A...641A...6P -- Planck Collaboration 2020, A&A, 641, A6`
+RESOLVED_RE = re.compile(r"^(?P<score>[\d.]+)\s+(?P<bibcode>\S+)\s+--\s")
 # Surname plus a four-digit year, optionally disambiguated (Dutton2007a).
 CITATION_KEY_RE = re.compile(r"^(?P<name>[A-Za-z][A-Za-z'\-]*)(?P<year>\d{4})[a-z]?$")
-CITE_RE = re.compile(r"\\[A-Za-z]*cite[A-Za-z]*\s*(?:\[[^\]]*\]\s*)*\{(?P<keys>[^}]*)\}")
+CITE_RE = re.compile(r"\\[A-Za-z]*cite[A-Za-z]*\*?\s*(?:\[[^\]]*\]\s*)*\{(?P<keys>[^}]*)\}")
 TEX_COMMENT_RE = re.compile(r"(?<!\\)%.*")
 # ponytail: 0.85 on an alphanumeric reduction; tighten only if real mismatches slip through.
 TITLE_SIMILARITY_THRESHOLD = 0.85
+# A strict roman numeral, so "civil" and "mid" are not read as series numbers.
+ROMAN_RE = re.compile(r"^m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$")
+WORD_RE = re.compile(r"[0-9a-z]+")
+# `@comment{@ARTICLE{Old2019, ...}}` is how an entry is disabled; the inner
+# entry must stay disabled, and @string/@preamble are not entries at all.
+NON_ENTRY_KINDS = {"comment", "string", "preamble"}
+# Only these statuses resolved to a real ADS record, so only these can make a
+# duplicate. For AMBIGUOUS or ERROR, matches[0] is just the top hit.
+RESOLVED_STATUSES = {
+    "OK",
+    "ADS_BIBTEX_MISMATCH",
+    "NON_ADS_BIBTEX",
+    "ADS_RECORD_CONFLICT",
+    "IDENTIFIER_MISMATCH",
+}
+DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", re.I)
+ARXIV_PREFIX_RE = re.compile(r"^arxiv:", re.I)
 STATUS_ORDER = (
     "OK",
     "ADS_BIBTEX_MISMATCH",
@@ -116,9 +146,9 @@ ISSUE_ACTIONS = {
     "IDENTIFIER_MISMATCH": "use --replace to review the ADS-exported replacement, paste a manual replacement, or skip",
     "ADS_UNVERIFIED_RATE_LIMITED": "rerun after the ADS cooldown expires; automatic replacement is disabled",
     "RATE_LIMITED": "rerun after the ADS cooldown expires, preferably with fewer workers or a longer --sleep",
-    "MISSING": "use --replace to paste a replacement, or edit the DOI/arXiv/title/year fields manually",
-    "AMBIGUOUS": "use --replace to paste the intended record, or add a DOI, arXiv ID, or ADS bibcode/adsurl",
-    "NO_IDENTIFIER": "use --replace to paste a replacement, or add a DOI, arXiv ID, ADS bibcode/adsurl, or title plus year",
+    "MISSING": "no ADS route matched; open the search link, find the record by hand, and paste it",
+    "AMBIGUOUS": "open the search link to pick the intended record, or add a DOI, arXiv ID, or ADS bibcode/adsurl",
+    "NO_IDENTIFIER": "open the search link, or add a DOI, arXiv ID, ADS bibcode/adsurl, or title plus year",
     "ERROR": "rerun later; if this repeats, inspect the reported request error",
 }
 AUTOMATIC_REPLACEMENT_STATUSES = {"ADS_BIBTEX_MISMATCH", "NON_ADS_BIBTEX"}
@@ -126,6 +156,8 @@ ADS_REPLACEMENT_STATUSES = AUTOMATIC_REPLACEMENT_STATUSES | {
     "ADS_RECORD_CONFLICT",
     "IDENTIFIER_MISMATCH",
 }
+# Nothing resolved, so the tool has done all it can and the user takes over.
+HANDOFF_STATUSES = {"MISSING", "AMBIGUOUS", "NO_IDENTIFIER"}
 MANUAL_REPLACEMENT_STATUSES = {
     "ADS_RECORD_CONFLICT",
     "IDENTIFIER_CONFLICT",
@@ -182,6 +214,11 @@ class AdsRateLimitError(Exception):
         self.wait = wait
 
 
+def is_empty_result(value: object) -> bool:
+    """True for a cached "nothing found": no documents, no export, no bibcode."""
+    return value is None or value == [] or value == ""
+
+
 class AdsCache:
     def __init__(self, path: Path, ttl: float, enabled: bool = True, refresh: bool = False):
         self.path = path
@@ -222,15 +259,28 @@ class AdsCache:
             stored_at = item.get("stored_at")
             if not isinstance(stored_at, (int, float)):
                 return None
-            if self.ttl >= 0 and time.time() - float(stored_at) > self.ttl:
+            value = item.get("value")
+            ttl = min(self.ttl, MISS_TTL) if is_empty_result(value) else self.ttl
+            if ttl >= 0 and time.time() - float(stored_at) > ttl:
                 return None
-            return item.get("value")
+            return value
 
     def set(self, namespace: str, key: str, value: object) -> None:
         if not self.enabled:
             return
         with self.lock:
             self.namespace(namespace)[key] = {"stored_at": time.time(), "value": value}
+            self.write_locked()
+
+    def set_many(self, namespace: str, items: dict[str, object]) -> None:
+        """Store a batch behind one file write, not one write per record."""
+        if not self.enabled or not items:
+            return
+        with self.lock:
+            space = self.namespace(namespace)
+            now = time.time()
+            for key, value in items.items():
+                space[key] = {"stored_at": now, "value": value}
             self.write_locked()
 
     def write_locked(self) -> None:
@@ -302,13 +352,18 @@ def fetch_ads_once(
 
     try:
         value = fetch()
-        store(value)
     except BaseException as exc:
         with ADS_IN_FLIGHT_LOCK:
             in_flight.exception = exc
             ADS_IN_FLIGHT.pop(request_key, None)
             in_flight.event.set()
         raise
+
+    try:
+        store(value)
+    except OSError as exc:
+        # A cache that cannot be written is a slow run, not a failed one.
+        print(f"Could not write the ADS cache: {exc}", file=sys.stderr)
 
     with ADS_IN_FLIGHT_LOCK:
         ADS_RUN_CACHE[request_key] = value
@@ -401,12 +456,24 @@ def find_entry_end(text: str, start: int) -> int:
 
 def parse_bibtex_text(text: str) -> list[BibEntry]:
     entries: list[BibEntry] = []
+    consumed = 0
     for match in ENTRY_RE.finditer(text):
+        # Anything inside a block already consumed is not a top-level entry. That
+        # is what keeps `@comment{@ARTICLE{...}}` disabled instead of parsing the
+        # inner entry, sending it to ADS, and rewriting the comment in place.
+        if match.start() < consumed:
+            continue
+        kind = match.group("kind").lower()
         try:
             end = find_entry_end(text, match.start())
         except ValueError as exc:
+            if kind in NON_ENTRY_KINDS:
+                continue
             line = text.count("\n", 0, match.start()) + 1
             raise ValueError(f"could not parse entry {match.group('key')} at line {line}: {exc}") from exc
+        consumed = end
+        if kind in NON_ENTRY_KINDS:
+            continue
         body = text[match.end() : end - 1]
         line = text.count("\n", 0, match.start()) + 1
         raw = text[match.start() : end]
@@ -447,8 +514,32 @@ def ads_bibcode(entry: BibEntry) -> str | None:
     return None
 
 
+def ads_search_url(query: str) -> str:
+    """The failed query, ready to run by hand at ADS."""
+    return f"{ADS_UI}/search/q={urllib.parse.quote(query, safe='')}"
+
+
+def ads_abstract_url(bibcode: str) -> str:
+    return f"{ADS_UI}/abs/{urllib.parse.quote(bibcode, safe='')}/abstract"
+
+
 def escape_query_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def bare_doi(value: str) -> str:
+    """A DOI without the `https://doi.org/` or `doi:` wrapper.
+
+    ADS exports the bare form and indexes only that, so querying the wrapper
+    resolves nothing and the entry is reported MISSING - which is how a correct
+    citation ends up looking broken.
+    """
+    return DOI_PREFIX_RE.sub("", value.strip(), count=1)
+
+
+def bare_arxiv(value: str) -> str:
+    """An arXiv id without its `arXiv:` prefix, in whatever case it was written."""
+    return ARXIV_PREFIX_RE.sub("", value.strip(), count=1)
 
 
 def candidate_queries(entry: BibEntry, include_bibcode: bool = True) -> list[tuple[str, str]]:
@@ -456,37 +547,66 @@ def candidate_queries(entry: BibEntry, include_bibcode: bool = True) -> list[tup
     if include_bibcode and (bibcode := ads_bibcode(entry)):
         queries.append(("bibcode", f'bibcode:"{escape_query_value(bibcode)}"'))
     if doi := entry.fields.get("doi"):
+        doi = bare_doi(doi)
         queries.append(("doi", f'doi:"{escape_query_value(doi)}"'))
         queries.append(("doi_identifier", f'identifier:"{escape_query_value(doi)}"'))
     if eprint := entry.fields.get("eprint"):
-        arxiv_id = eprint.removeprefix("arXiv:").strip()
+        arxiv_id = bare_arxiv(eprint)
         queries.append(("arxiv", f'identifier:"arXiv:{escape_query_value(arxiv_id)}"'))
     title = entry.fields.get("title")
     year = entry.fields.get("year")
     if title and year:
-        clean_title = title.replace("{", "").replace("}", "")
+        # Solr tokenises `\\sc` and `\\ensuremath` as words and matches nothing;
+        # normalising strips them the same way the comparison does.
+        clean_title = normalized_identity_value(title)
         queries.append(("title", f'title:"{escape_query_value(clean_title)}" year:{year}'))
     return queries
 
 
-def identifier_query_groups(entry: BibEntry, include_bibcode: bool) -> list[tuple[str, list[tuple[str, str]]]]:
-    groups: list[tuple[str, list[tuple[str, str]]]] = []
-    if include_bibcode and (bibcode := ads_bibcode(entry)):
-        groups.append(("bibcode", [("bibcode", f'bibcode:"{escape_query_value(bibcode)}"')]))
+def local_identifiers(entry: BibEntry) -> list[tuple[str, str]]:
+    """The identifiers the entry claims about itself, as (label, comparable token)."""
+    found: list[tuple[str, str]] = []
+    if bibcode := ads_bibcode(entry):
+        found.append(("bibcode", normalized_identity_value(bibcode)))
     if doi := entry.fields.get("doi"):
-        groups.append(
-            (
-                "doi",
-                [
-                    ("doi", f'doi:"{escape_query_value(doi)}"'),
-                    ("doi_identifier", f'identifier:"{escape_query_value(doi)}"'),
-                ],
-            )
-        )
+        found.append(("doi", normalized_identity_value(bare_doi(doi))))
     if eprint := entry.fields.get("eprint"):
-        arxiv_id = eprint.removeprefix("arXiv:").strip()
-        groups.append(("arxiv", [("arxiv", f'identifier:"arXiv:{escape_query_value(arxiv_id)}"')]))
-    return groups
+        found.append(("arxiv", normalized_identity_value(bare_arxiv(eprint))))
+    return found
+
+
+def combined_identifier_query(entry: BibEntry) -> str:
+    """One query covering every identifier the entry carries.
+
+    ADS's `identifier` field indexes bibcodes, DOIs and arXiv ids together, and a
+    returned record lists all of its own. So one round trip answers what used to
+    take one per identifier - and answers it exactly, by set membership, rather
+    than by how many rows happened to come back.
+    """
+    terms: list[str] = []
+    if bibcode := ads_bibcode(entry):
+        terms.append(f'identifier:"{escape_query_value(bibcode)}"')
+    if doi := entry.fields.get("doi"):
+        bare = escape_query_value(bare_doi(doi))
+        # Both index paths: a DOI is not always reachable through `identifier`.
+        terms.append(f'doi:"{bare}"')
+        terms.append(f'identifier:"{bare}"')
+    if eprint := entry.fields.get("eprint"):
+        terms.append(f'identifier:"arXiv:{escape_query_value(bare_arxiv(eprint))}"')
+    return " OR ".join(terms)
+
+
+def match_identity_tokens(match: dict[str, object]) -> set[str]:
+    """Every identifier a returned ADS record answers to."""
+    values = [str(match.get("bibcode", ""))]
+    for field in ("identifier", "doi"):
+        raw = match.get(field) or []
+        values.extend(str(item) for item in (raw if isinstance(raw, list) else [raw]))
+    tokens: set[str] = set()
+    for value in values:
+        if normalized := normalized_identity_value(value):
+            tokens.update({normalized, bare_doi(normalized), bare_arxiv(normalized)})
+    return tokens
 
 
 def match_title(match: dict[str, object]) -> str:
@@ -510,6 +630,27 @@ def preferred_match(matches: list[dict[str, object]]) -> dict[str, object] | Non
     return refereed[0] if len(refereed) == 1 else None
 
 
+def ads_search_guarded(
+    label: str,
+    query: str,
+    token: str,
+    rows: int,
+    timeout: float,
+    sleep: float,
+) -> tuple[list[dict[str, object]], AdsResult | None]:
+    """Search, or the ERROR result that explains why not."""
+    try:
+        return ads_search(query, token, rows=rows, timeout=timeout, sleep=sleep), None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            return [], AdsResult("ERROR", query, [], f"ADS HTTP 429 rate limit for {label} query; rerun later with --jobs 1 --sleep 3")
+        return [], AdsResult("ERROR", query, [], f"ADS HTTP {exc.code} for {label} query")
+    except urllib.error.URLError as exc:
+        return [], AdsResult("ERROR", query, [], f"ADS request failed for {label} query: {exc.reason}")
+    except TimeoutError:
+        return [], AdsResult("ERROR", query, [], f"ADS request timed out for {label} query")
+
+
 def run_queries(
     queries: list[tuple[str, str]],
     token: str,
@@ -519,16 +660,9 @@ def run_queries(
 ) -> AdsResult:
     messages: list[str] = []
     for label, query in queries:
-        try:
-            matches = ads_search(query, token, rows=rows, timeout=timeout, sleep=sleep)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                return AdsResult("ERROR", query, [], f"ADS HTTP 429 rate limit for {label} query; rerun later with --jobs 1 --sleep 3")
-            return AdsResult("ERROR", query, [], f"ADS HTTP {exc.code} for {label} query")
-        except urllib.error.URLError as exc:
-            return AdsResult("ERROR", query, [], f"ADS request failed for {label} query: {exc.reason}")
-        except TimeoutError:
-            return AdsResult("ERROR", query, [], f"ADS request timed out for {label} query")
+        matches, failure = ads_search_guarded(label, query, token, rows, timeout, sleep)
+        if failure is not None:
+            return failure
 
         if len(matches) == 1:
             return AdsResult("OK", query, matches)
@@ -617,6 +751,13 @@ def ads_search(query: str, token: str, rows: int, timeout: float, sleep: float =
 
 
 def ads_export_bibtex(bibcode: str, token: str, timeout: float) -> str:
+    """The ADS BibTeX for one record, through the same request shape as a batch.
+
+    Not the per-bibcode GET: that endpoint truncates the author list to ten names
+    plus a literal `et al.`, which is the malformed author this tool warns about,
+    and which it would then offer as a replacement. The POST form returns the full
+    list, so one record and a hundred records come back identical either way.
+    """
     cached = ads_cached_value("bibtex", bibcode)
     if isinstance(cached, str) and cached.strip():
         return cached
@@ -624,19 +765,8 @@ def ads_export_bibtex(bibcode: str, token: str, timeout: float) -> str:
     def fetch() -> object:
         if (wait := active_ads_rate_limit()) is not None:
             raise AdsRateLimitError(wait)
-
-        quoted_bibcode = urllib.parse.quote(bibcode, safe="")
-        request = urllib.request.Request(
-            f"{ADS_BIBTEX_API}/{quoted_bibcode}",
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "check-ads-bib/0.1"},
-        )
-        body = urlopen_with_retries(request, timeout).decode("utf-8")
-        try:
-            payload = json.loads(body)
-            export = str(payload.get("export", "")).strip()
-        except json.JSONDecodeError:
-            export = body.strip()
-        if not export:
+        export = ads_export_bibtex_many([bibcode], token, timeout).get(bibcode, "")
+        if not export.strip():
             raise RuntimeError(f"ADS returned no BibTeX export for {bibcode}")
         return export
 
@@ -648,6 +778,139 @@ def ads_export_bibtex(bibcode: str, token: str, timeout: float) -> str:
     if not isinstance(export, str) or not export.strip():
         raise RuntimeError(f"ADS returned no BibTeX export for {bibcode}")
     return export
+
+
+def first_author_name(author: str) -> str:
+    """The first author as written, braces dropped: `{Riess}, Adam G.` -> `Riess, Adam G.`"""
+    first = AUTHOR_SPLIT_RE.split(author.strip(), maxsplit=1)[0]
+    return " ".join(first.replace("{", "").replace("}", "").split())
+
+
+def reference_string(entry: BibEntry) -> str:
+    """A citation string for the ADS resolver, or "" when there is too little to try.
+
+    The resolver wants bibliographic coordinates, not a title: it refuses a
+    reference "with no year and volume". Journal macros are left as written -
+    `\\aap` resolves, just one confidence step below `A&A`, and every candidate is
+    identity-checked afterwards anyway, so the extra points buy nothing.
+    """
+    author = first_author_name(entry.fields.get("author", ""))
+    year = entry.fields.get("year", "").strip()
+    if not author or not year:
+        return ""
+    journal = entry.fields.get("journal", "").strip()
+    volume = entry.fields.get("volume", "").strip()
+    if journal and volume:
+        page = entry.fields.get("eid", "") or entry.fields.get("pages", "")
+        page_match = FIRST_PAGE_RE.match(page.strip())
+        parts = [journal, volume] + ([page_match.group(0)] if page_match else [])
+        return f"{author} {year}, " + ", ".join(parts)
+    # No coordinates: a book or a preprint. Worth one try on the title.
+    if title := normalized_identity_value(entry.fields.get("title", "")):
+        return f"{author} {year}, {title}"
+    return ""
+
+
+def ads_resolve_reference(reference: str, token: str, timeout: float) -> str | None:
+    """Ask ADS to match a reference string, and return its bibcode or None.
+
+    The reported score is deliberately ignored. A reference with one wrong page
+    still comes back at 0.7 - pointing at a different author's paper - so the
+    verdict has to come from the identity check, exactly as it does for a bibcode.
+    """
+    cached = ads_cached_value("reference", reference)
+    if isinstance(cached, str):
+        return cached or None
+
+    def fetch() -> object:
+        if (wait := active_ads_rate_limit()) is not None:
+            raise AdsRateLimitError(wait)
+        request = urllib.request.Request(
+            ADS_REFERENCE_API,
+            data=json.dumps({"reference": [reference]}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "check-ads-bib/0.1",
+            },
+        )
+        body = urlopen_with_retries(request, timeout).decode("utf-8")
+        line = body.strip().splitlines()[0] if body.strip() else ""
+        if isinstance(parsed := _resolver_payload(body), str):
+            line = parsed
+        match = RESOLVED_RE.match(line)
+        if not match or float(match.group("score")) <= 0:
+            return ""
+        bibcode = match.group("bibcode")
+        # A failed match comes back as a row of dots, not a bibcode.
+        return "" if set(bibcode) <= {"."} else bibcode
+
+    def store(value: object) -> None:
+        if ADS_CACHE is not None:
+            ADS_CACHE.set("reference", reference, value)
+
+    bibcode = fetch_ads_once("reference", reference, fetch, store)
+    return bibcode if isinstance(bibcode, str) and bibcode else None
+
+
+def _resolver_payload(body: str) -> object:
+    """The endpoint answers with a bare line, or with {"resolved": line}."""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        resolved = payload.get("resolved")
+        if isinstance(resolved, list) and resolved:
+            resolved = resolved[0]
+        if isinstance(resolved, dict):
+            return f"{resolved.get('score', 0)} {resolved.get('bibcode', '')} -- "
+        return resolved if isinstance(resolved, str) else None
+    return None
+
+
+def ads_export_bibtex_many(bibcodes: list[str], token: str, timeout: float) -> dict[str, str]:
+    """Export many records in one request. ADS keys each entry by its own bibcode."""
+    request = urllib.request.Request(
+        ADS_BIBTEX_API,
+        data=json.dumps({"bibcode": list(bibcodes)}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "check-ads-bib/0.1",
+        },
+    )
+    body = urlopen_with_retries(request, timeout).decode("utf-8")
+    try:
+        export = str(json.loads(body).get("export", ""))
+    except json.JSONDecodeError:
+        export = body
+    return {entry.key: entry.raw for entry in parse_bibtex_text(export)}
+
+
+def prefetch_exports(entries: list[BibEntry], token: str, timeout: float) -> None:
+    """Warm the export cache in bulk, so the per-entry path makes no export call.
+
+    Only the bibcodes the file already names can be known before resolving - but
+    that is most of them, because ADS's own export writes an adsurl into every
+    entry. One request per hundred replaces one per entry.
+    """
+    if (wait := active_ads_rate_limit()) is not None:
+        return
+    wanted = sorted({bibcode for entry in entries if (bibcode := ads_bibcode(entry))})
+    missing = [bibcode for bibcode in wanted if ads_cached_value("bibtex", bibcode) is None]
+    for index in range(0, len(missing), EXPORT_BATCH):
+        batch = missing[index : index + EXPORT_BATCH]
+        try:
+            exports = ads_export_bibtex_many(batch, token, timeout)
+        except Exception as exc:  # noqa: BLE001 - any failure just means the old path
+            print(f"Bulk ADS export failed ({exc}); falling back to one request per entry.", file=sys.stderr)
+            return
+        if ADS_CACHE is not None:
+            ADS_CACHE.set_many("bibtex", exports)
+        with ADS_IN_FLIGHT_LOCK:
+            for bibcode, text in exports.items():
+                ADS_RUN_CACHE[("bibtex", bibcode)] = text
 
 
 def normalize_field_value(value: str) -> str:
@@ -679,6 +942,37 @@ def normalized_identity_value(value: str) -> str:
 
 def alphanumeric_key(value: str) -> str:
     return NON_ALNUM_RE.sub("", normalized_identity_value(value))
+
+
+def normalized_identifier(field: str, value: str) -> str:
+    """An identifier as ADS exports it, whatever wrapper the local entry used.
+
+    `eprint = {arXiv:2001.00001}` and `doi = {https://doi.org/10.1/x}` are both
+    ordinary in the wild and name the same record as the bare form.
+    """
+    value = normalized_identity_value(value)
+    return (DOI_PREFIX_RE if field == "doi" else ARXIV_PREFIX_RE).sub("", value)
+
+
+def series_tokens(title: str) -> list[str]:
+    """The digits and roman numerals in a title, in order.
+
+    Papers in one series differ by these and by almost nothing else, so a
+    character ratio cannot separate them: `Paper I` against `Paper II` scores
+    0.99, and `Planck 2015 results. XIII` against `Planck 2018 results. VI`
+    scores 0.93 - both far above the threshold, both the wrong paper.
+    """
+    words = WORD_RE.findall(normalized_identity_value(title))
+    return [word for word in words if word.isdigit() or ROMAN_RE.match(word)]
+
+
+def titles_conflict(local: str, ads: str) -> bool:
+    """True when two titles should not be taken for the same paper."""
+    if not alphanumeric_key(local) or not alphanumeric_key(ads):
+        return False
+    if series_tokens(local) != series_tokens(ads):
+        return True
+    return title_similarity(local, ads) < TITLE_SIMILARITY_THRESHOLD
 
 
 def title_similarity(local: str, ads: str) -> float:
@@ -730,13 +1024,13 @@ def identity_conflicts(entry: BibEntry, ads_entry: BibEntry) -> list[str]:
 
     local_title = entry.fields.get("title")
     ads_title = ads_entry.fields.get("title")
-    if local_title and ads_title and title_similarity(local_title, ads_title) < TITLE_SIMILARITY_THRESHOLD:
+    if local_title and ads_title and titles_conflict(local_title, ads_title):
         conflicts.append("title")
 
     for field in ("doi", "eprint"):
         local = entry.fields.get(field)
         ads = ads_entry.fields.get(field)
-        if local and ads and normalized_identity_value(local) != normalized_identity_value(ads):
+        if local and ads and normalized_identifier(field, local) != normalized_identifier(field, ads):
             conflicts.append(field)
 
     local_author = entry.fields.get("author")
@@ -757,32 +1051,44 @@ def malformed_author(entry: BibEntry) -> bool:
 
 
 def identifier_consensus(
-    groups: list[tuple[str, list[tuple[str, str]]]],
+    entry: BibEntry,
     token: str,
     rows: int,
     timeout: float,
     sleep: float,
 ) -> AdsResult:
-    resolved: list[tuple[str, str, AdsResult]] = []
-    missing: list[tuple[str, AdsResult]] = []
-    all_matches: list[dict[str, object]] = []
+    """Resolve every identifier the entry carries, in one ADS request.
 
-    for label, queries in groups:
-        result = run_queries(queries, token, rows, timeout, sleep)
-        if result.status in {"ERROR", "AMBIGUOUS"}:
-            return result
-        if result.status == "MISSING":
-            missing.append((label, result))
+    Each returned record is matched against each local identifier by set
+    membership, so "the DOI and the bibcode name different papers" is read off
+    one response rather than inferred from two.
+    """
+    identifiers = local_identifiers(entry)
+    query = combined_identifier_query(entry)
+    if not identifiers or not query:
+        return AdsResult("NO_IDENTIFIER", "", [], "no bibcode, DOI, or eprint")
+
+    matches, failure = ads_search_guarded("identifier", query, token, rows, timeout, sleep)
+    if failure is not None:
+        return failure
+
+    resolved: list[tuple[str, str, dict[str, object]]] = []
+    missing: list[str] = []
+    for label, wanted in identifiers:
+        hits = [match for match in matches if wanted in match_identity_tokens(match)]
+        if not hits:
+            missing.append(label)
             continue
-        if result.status == "OK":
-            bibcode = str(result.matches[0].get("bibcode", ""))
-            resolved.append((label, bibcode, result))
-            all_matches.extend(result.matches)
+        if len(hits) > 1:
+            if (preferred := preferred_match(hits)) is None:
+                return AdsResult("AMBIGUOUS", query, hits, f"the {label} matches {len(hits)} ADS records")
+            hits = [preferred]
+        resolved.append((label, str(hits[0].get("bibcode", "")), hits[0]))
 
+    all_matches = [match for _, _, match in resolved]
     unique_bibcodes = {bibcode for _, bibcode, _ in resolved if bibcode}
     if len(unique_bibcodes) > 1:
         details = "; ".join(f"{label}={bibcode}" for label, bibcode, _ in resolved)
-        query = resolved[0][2].query if resolved else ""
         return AdsResult(
             "IDENTIFIER_CONFLICT",
             query,
@@ -791,23 +1097,17 @@ def identifier_consensus(
         )
 
     if resolved and missing:
-        details = "; ".join(label for label, _ in missing)
-        query = missing[0][1].query
         return AdsResult(
             "IDENTIFIER_MISMATCH",
             query,
             all_matches,
-            f"some identifiers resolve to {resolved[0][1]}, but {details} lookup failed; manual review required",
+            f"some identifiers resolve to {resolved[0][1]}, but {'; '.join(missing)} lookup failed; manual review required",
         )
 
     if resolved:
-        return resolved[0][2]
+        return AdsResult("OK", query, all_matches)
 
-    if missing:
-        messages = ", ".join(f"{label}:{result.message}" for label, result in missing)
-        return AdsResult("MISSING", missing[-1][1].query, [], messages)
-
-    return AdsResult("NO_IDENTIFIER", "", [], "no bibcode, DOI, or eprint")
+    return AdsResult("MISSING", query, [], ", ".join(f"{label}:0" for label in missing))
 
 
 def bibtex_matches_ads(entry: BibEntry, ads_entry: BibEntry) -> bool:
@@ -890,24 +1190,102 @@ def rate_limited_result(entry: BibEntry, wait: float) -> AdsResult:
     )
 
 
+def propose_replacement(
+    entry: BibEntry,
+    bibcode: str,
+    result: AdsResult,
+    token: str,
+    timeout: float,
+    reason: str,
+) -> AdsResult:
+    """Attach the ADS export to a record the entry's own identifiers did not find.
+
+    The point is to hand over a BibTeX to look at rather than a dead end. A real
+    disagreement still comes back as ADS_RECORD_CONFLICT; otherwise the status is
+    IDENTIFIER_MISMATCH, which is the truth - the record is right, the entry's own
+    identifiers are not - and which is never a one-keypress replacement unless the
+    export itself agrees on title, author, DOI, eprint and key.
+    """
+    verified = verify_ads_bibtex(entry, bibcode, result, token, timeout, local_bibcode=False)
+    if verified.status in {"ERROR", "ADS_RECORD_CONFLICT"}:
+        return verified
+    return AdsResult("IDENTIFIER_MISMATCH", verified.query, verified.matches, reason, ads_bibtex=verified.ads_bibtex)
+
+
+def resolve_by_fallback(
+    entry: BibEntry,
+    token: str,
+    rows: int,
+    timeout: float,
+    sleep: float,
+) -> tuple[str, str, AdsResult] | None:
+    """Find the record without trusting the entry's identifiers. (route, bibcode, result).
+
+    Title+year first, then ADS's own reference resolver on author/year/journal/
+    volume/page - the coordinates no Solr query here uses, and the only route that
+    works when the title has been reworded or truncated.
+    """
+    title_queries = [pair for pair in candidate_queries(entry, include_bibcode=False) if pair[0] == "title"]
+    if title_queries:
+        result = run_queries(title_queries, token, rows, timeout, sleep)
+        if result.status == "OK":
+            return ("title and year", str(result.matches[0].get("bibcode", "")), result)
+
+    if reference := reference_string(entry):
+        if bibcode := ads_resolve_reference(reference, token, timeout):
+            lookup = run_queries([("bibcode", f'bibcode:"{escape_query_value(bibcode)}"')], token, rows, timeout, sleep)
+            matches = lookup.matches if lookup.status == "OK" else [{"bibcode": bibcode}]
+            return ("the ADS reference resolver", bibcode, AdsResult("OK", reference, matches))
+    return None
+
+
+def with_fallback(
+    entry: BibEntry,
+    missing: AdsResult,
+    token: str,
+    rows: int,
+    timeout: float,
+    sleep: float,
+) -> AdsResult:
+    """Nothing the entry claims about itself resolved; try the routes that ignore it."""
+    if missing.status != "MISSING":
+        return missing
+    found = resolve_by_fallback(entry, token, rows, timeout, sleep)
+    if found is None:
+        return missing
+    route, bibcode, result = found
+    return propose_replacement(
+        entry,
+        bibcode,
+        result,
+        token,
+        timeout,
+        f"no bibcode/DOI/eprint lookup resolved, but {route} matched {bibcode}; review before replacing",
+    )
+
+
 def check_entry_live(entry: BibEntry, token: str, rows: int, timeout: float, sleep: float) -> AdsResult:
     local_bibcode = ads_bibcode(entry)
-    consensus_groups = identifier_query_groups(entry, include_bibcode=bool(local_bibcode))
+    identifiers = local_identifiers(entry)
     fallback_queries = candidate_queries(entry, include_bibcode=False)
-    if not consensus_groups and not fallback_queries:
+    if not identifiers and not fallback_queries:
         return AdsResult("NO_IDENTIFIER", "", [], "no bibcode, adsurl, DOI, eprint, or title+year")
 
-    if not local_bibcode:
-        result = identifier_consensus(consensus_groups, token, rows, timeout, sleep) if consensus_groups else run_queries(fallback_queries, token, rows, timeout, sleep)
+    if not identifiers:
+        result = run_queries(fallback_queries, token, rows, timeout, sleep)
         if result.status == "OK":
             bibcode = str(result.matches[0].get("bibcode", ""))
             return verify_ads_bibtex(entry, bibcode, result, token, timeout, local_bibcode=False)
-        return result
+        return with_fallback(entry, result, token, rows, timeout, sleep)
 
-    consensus = identifier_consensus(consensus_groups, token, rows, timeout, sleep)
+    consensus = identifier_consensus(entry, token, rows, timeout, sleep)
     if consensus.status == "OK":
-        return verify_ads_bibtex(entry, local_bibcode, consensus, token, timeout)
-    return consensus
+        bibcode = local_bibcode or str(consensus.matches[0].get("bibcode", ""))
+        return verify_ads_bibtex(entry, bibcode, consensus, token, timeout, local_bibcode=bool(local_bibcode))
+    # Always arrive with something to look at: a partial resolve still gets its export.
+    if consensus.status == "IDENTIFIER_MISMATCH" and (bibcode := ads_replacement_bibcode(consensus)):
+        return propose_replacement(entry, bibcode, consensus, token, timeout, consensus.message)
+    return with_fallback(entry, consensus, token, rows, timeout, sleep)
 
 
 def check_entry(
@@ -979,9 +1357,36 @@ def print_issue_overview(result: AdsResult) -> None:
         print_detail("Issue", description)
 
 
+def issue_search_url(entry: BibEntry, result: AdsResult) -> str:
+    """A deliberately loose ADS search, for the entries a human has to finish.
+
+    Replaying the query that just returned nothing helps nobody. Dropping the
+    phrase quotes and widening the year by one is what actually finds a record
+    whose title was reworded between the preprint and the journal.
+    """
+    terms: list[str] = []
+    # Punctuation only narrows a search a human is about to eyeball.
+    title = " ".join(NON_ALNUM_RE.sub(" ", normalized_identity_value(entry.fields.get("title", ""))).split())
+    if title:
+        terms.append(f"title:({escape_query_value(title)})")
+    if author := first_author_name(entry.fields.get("author", "")):
+        terms.append(f'author:"{escape_query_value(author.split(",")[0].strip())}"')
+    year = entry.fields.get("year", "").strip()
+    if year.isdigit():
+        terms.append(f"year:{int(year) - 1}-{int(year) + 1}")
+    if terms:
+        return ads_search_url(" ".join(terms))
+    return ads_search_url(result.query) if result.query and result.query != "local" else ""
+
+
 def print_issue_action(result: AdsResult) -> None:
     if action := ISSUE_ACTIONS.get(result.status):
         print_detail("Action", action)
+
+
+def print_issue_search(entry: BibEntry, result: AdsResult) -> None:
+    if result.status in HANDOFF_STATUSES and (url := issue_search_url(entry, result)):
+        print_detail("Search", url)
 
 
 def match_bibcode(match: dict[str, object]) -> str | None:
@@ -1110,6 +1515,7 @@ def print_result(entry: BibEntry, result: AdsResult) -> None:
         print_detail("ADS", format_match(result.matches[0]))
         print_replacement_suggestion(entry, result)
     print_issue_action(result)
+    print_issue_search(entry, result)
 
 
 def replace_bibtex_key(bibtex: str, key: str) -> str:
@@ -1298,6 +1704,12 @@ def ensure_backup(path: Path, existing_backup: Path | None) -> Path:
 
 
 def write_text_atomically(path: Path, text: str) -> None:
+    """Replace a file's contents in one step, through its symlink and mode.
+
+    Without resolving, a .bib symlinked from a shared master is silently turned
+    into a private 0600 copy and the master never changes.
+    """
+    path = path.resolve()
     with tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
@@ -1309,6 +1721,8 @@ def write_text_atomically(path: Path, text: str) -> None:
         tmp_path = Path(handle.name)
         handle.write(text)
     try:
+        if path.exists():
+            shutil.copymode(path, tmp_path)
         os.replace(tmp_path, path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -1364,11 +1778,17 @@ def replace_outdated_entries(
     total_candidates = len(candidates)
     for index, (entry, result, bibcode) in enumerate(candidates, start=1):
         remaining_after = total_candidates - index
-        current_entries = {current.key: current for current in parse_bibtex_text(original_text)}
-        current_entry = current_entries.get(entry.key)
-        if current_entry is None:
+        # Re-read every time: an edit saved in an editor between two accepts
+        # would otherwise be overwritten by the text this loop started with.
+        original_text = bibfile.read_text(encoding="utf-8")
+        matching = [current for current in parse_bibtex_text(original_text) if current.key == entry.key]
+        if not matching:
             print(f"\nSkipping {entry.key}: entry no longer exists in {bibfile}.")
             continue
+        if len(matching) > 1:
+            print(f"\nSkipping {entry.key}: {len(matching)} entries share this key; remove the duplicate first.")
+            continue
+        current_entry = matching[0]
 
         current = original_text[current_entry.start : current_entry.end]
         print_replacement_separator(
@@ -1466,7 +1886,7 @@ def replace_outdated_entries(
 
 def resolved_identity(entry: BibEntry, result: AdsResult) -> tuple[str, str] | None:
     """A stable identity for duplicate grouping: the resolved bibcode, else the local DOI."""
-    if result.matches and (bibcode := str(result.matches[0].get("bibcode", ""))):
+    if result.status in RESOLVED_STATUSES and result.matches and (bibcode := str(result.matches[0].get("bibcode", ""))):
         return ("bibcode", bibcode)
     if doi := entry.fields.get("doi"):
         return ("doi", normalized_identity_value(doi))
@@ -1601,10 +2021,19 @@ def check_entries_parallel(
     jobs: int,
     progress: bool,
 ) -> list[tuple[BibEntry, AdsResult]]:
+    prefetch_exports(entries, token, timeout)
     if jobs == 1:
         results: list[tuple[BibEntry, AdsResult]] = []
         for entry in progress_iter(entries, len(entries), progress, "Checking ADS"):
-            results.append((entry, check_entry(entry, token, rows=rows, timeout=timeout, sleep=sleep)))
+            # Same guard as the worker pool below: a truncated response or a
+            # captive-portal HTML page must cost one entry, not the whole run.
+            try:
+                result = check_entry(entry, token, rows=rows, timeout=timeout, sleep=sleep)
+            except AdsRateLimitError:
+                raise
+            except Exception as exc:
+                result = AdsResult("ERROR", "", [], f"check failed: {exc}")
+            results.append((entry, result))
         return results
 
     results: list[tuple[BibEntry, AdsResult] | None] = [None] * len(entries)
@@ -1678,6 +2107,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Interactively replace ADS_BIBTEX_MISMATCH/NON_ADS_BIBTEX entries.",
     )
     parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Open the browser review app instead of the interactive --replace prompts.",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="With --review, do not launch a browser.",
+    )
+    parser.add_argument(
         "--tex",
         type=Path,
         nargs="+",
@@ -1713,6 +2152,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.jobs < 1:
         print("--jobs must be at least 1.", file=sys.stderr)
+        return 2
+    if args.replace and args.review:
+        print("Use --replace or --review, not both.", file=sys.stderr)
         return 2
     if args.cache_ttl < 0:
         print("--cache-ttl must be at least 0.", file=sys.stderr)
@@ -1765,6 +2207,20 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 1
     if args.replace:
         replace_outdated_entries(args.bibfile, results, args.token, args.timeout)
+    if args.review:
+        import review
+
+        session = review.Review(
+            args.bibfile,
+            args.token,
+            rows=args.rows,
+            timeout=args.timeout,
+            sleep=args.sleep,
+            jobs=args.jobs,
+            tex=args.tex,
+        )
+        session.adopt(results)
+        review.serve(session, open_browser=not args.no_open)
     return exit_code
 
 

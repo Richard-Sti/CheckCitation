@@ -1,4 +1,11 @@
+# ADS responses, cached for a day. Yours, and regenerated on demand.
 .ads_cache.json
+
+# Backups the review app and --replace write beside a .bib.
+*.bib.bak
+*.bib.bak[0-9]*
+
 __pycache__/
 *.py[cod]
 docs/superpowers/specs/
+.DS_Store

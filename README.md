@@ -62,6 +62,13 @@ Review and replace problematic entries interactively:
 ./check_ads_bib.sh path/to/ref.bib --replace
 ```
 
+Or do the same in a browser:
+
+```sh
+./check_ads_bib.sh path/to/ref.bib --review
+./check_ads_bib.sh path/to/ref.bib --review --no-open   # don't launch a browser
+```
+
 Also cross-check which keys your paper actually cites:
 
 ```sh
@@ -77,14 +84,66 @@ Useful options:
 ./check_ads_bib.sh path/to/ref.bib --no-progress
 ```
 
+## The review app
+
+`--review` runs the usual check, prints the usual report, and then serves a local
+page at <http://localhost:8766>. Stdlib only, bound to `127.0.0.1`, no build step
+and nothing to install. The only file it writes is the `.bib` you pointed it at.
+
+Three views under a stats strip:
+
+- **Review** — one card per entry ADS disagrees with, in file order. Each card shows
+  the issue in the report's own words, the local entry against the ADS export field
+  by field with the disagreeing fields marked, the ADS records that matched, and the
+  proposed BibTeX in an editable box. `->`/`l` replaces, `<-`/`h` keeps the local
+  entry, `space` defers it to the back of the queue, `u` undoes the last replacement
+  by writing the entry back exactly as it was.
+- **All** — every entry with its status and line, filterable to issues, entries that
+  agree with ADS, or skipped ones, sortable by key, line or status. `Review` on any
+  row sends it to the front of the card stack.
+- **Cross-check** — duplicates, warnings, and, when `--tex` is given, the keys cited
+  but undefined and the entries defined but never cited.
+
+Every card that resolved arrives with the proposed BibTeX already in the box and
+every ADS record linked to its abstract page. A card that resolved nowhere says so
+and offers the ADS search to run instead, because at that point the tool has done
+what it can and finding the record is yours.
+
+The citation key is always kept, whatever the pasted or exported BibTeX says. One
+backup per session is written before the first replacement, and every write is
+atomic. A replacement is only ever one keypress when the ADS export is in hand and
+disagrees with nothing; anything that might be a different paper takes a button and
+an inline confirmation, which is the browser's version of the CLI's typed `replace`.
+If the `.bib` changes on disk while a tab is open, that tab's next write is refused
+with a reload prompt instead of overwriting the edit.
+
 ## What It Does
 
 For each BibTeX entry, the tool tries to resolve an ADS record using the local
-`bibcode`/`adsurl`, DOI, arXiv ID, or title plus year.
+`bibcode`/`adsurl`, DOI, and arXiv ID. If none of those resolve, it does not give
+up: it falls back to a title-plus-year search, and then to ADS's own reference
+resolver, which matches on author, year, journal, volume and page — the
+coordinates no query here uses, and the only route that still works when the
+title was reworded between the preprint and the journal. Either fallback route
+reports `IDENTIFIER_MISMATCH`, because the record is right and the entry's own
+identifiers are not.
+
+A fallback match is never taken on trust. The resolver reports a confidence
+score, and that score is ignored: `Riess, A. G. 2022, ApJ, 934, L7` with the page
+mistyped as `L9` comes back at 0.7 pointing at a different author's paper. Every
+candidate, however it was found, goes through the same identity check as a
+bibcode, so a typo'd DOI on an otherwise correct entry resolves and is flagged
+`ADS_RECORD_CONFLICT` for the `doi` field rather than silently replaced.
+
+When nothing matches at all, the entry is reported `MISSING` with a `Search` link:
+a deliberately loose ADS query built from the title words, first author and a
+±1 year range. Replaying the query that just returned nothing helps nobody.
 
 Whichever route resolves, the ADS record is then checked against the local entry
 on title, first-author surname, DOI, eprint, and the citation key. Titles are
-compared fuzzily after LaTeX markup is stripped, so `H\,{\sc i}` and `H I` agree.
+compared fuzzily after LaTeX markup is stripped, so `H\,{\sc i}` and `H I` agree,
+but their series numbering has to match exactly: `Paper I` and `Paper II` score
+0.99 on a character ratio and are not the same paper.
 The citation key check is the only signal independent of the entry's own fields:
 a key of the form `Surname2020` is compared against the record's first author and
 year, which is what catches an entry that is internally consistent but is simply
@@ -97,8 +156,12 @@ It then lists `Duplicates` (two keys resolving to the same record) and
 `Warnings` (such as a literal `{et al.}` author, which renders as
 `(Koribalski & et al. 2020)`).
 
-Entries that legitimately have no ADS record, such as books or software, can be
-excluded by putting a directive on the line directly above them:
+Books and conference proceedings often resolve through the reference resolver —
+`Jeffreys, H. 1939, Theory of Probability` finds `1939thpr.book.....J` — so try a
+run before reaching for a skip directive.
+
+Entries that genuinely have no ADS record, such as software or unpublished notes,
+can be excluded by putting a directive on the line directly above them:
 
 ```bibtex
 % checkcitation: skip
@@ -127,10 +190,44 @@ an entry with a different paper does not.
 ## Tests
 
 ```sh
-python3 test_check_ads_bib.py
+python3 test_check_ads_bib.py   # parsing, comparison, replacement safety
+python3 test_review.py          # the review server's API and what it writes
+node test_review.js             # the page's script and its risk gate
 ```
 
-The tests are offline and use no framework.
+The tests are offline and use no framework. `test_review.py` stubs ADS and runs a
+real server on an ephemeral port; `test_review.js` runs the page's own `<script>`
+in a `vm` context against a fake document.
 
-ADS search responses and ADS BibTeX exports are cached in `.ads_cache.json` for
-24 hours by default. Use `--refresh-cache` to fetch fresh ADS responses.
+ADS responses are cached in `.ads_cache.json`. A record that resolved keeps for
+30 days, because a published record does not change; a lookup that found nothing
+keeps for an hour, because it stops being nothing the moment ADS indexes the
+paper. `--cache-ttl` sets the first, `--refresh-cache` ignores both.
+
+## The ADS call budget
+
+One token gets **5000 requests a day**, shared across search, export and the
+reference resolver — so parallelism (`--jobs`) buys wall-clock time, not headroom.
+Eight workers reach the ceiling eight times faster, not later. What buys headroom
+is spending fewer requests per entry:
+
+- **One search per entry, not three.** ADS's `identifier` field indexes bibcodes,
+  DOIs and arXiv ids together, and a returned record lists all of its own. So one
+  `identifier:(…) OR doi:"…"` query resolves every identifier the entry carries,
+  and "the DOI and the bibcode name different papers" is read off one response by
+  set membership rather than inferred from three.
+- **One export request per hundred entries, not one per entry.** Every bibcode the
+  file already names is exported in bulk before the check starts, and the per-entry
+  path then finds it in the cache.
+- **Re-runs cost nothing** inside the 30-day window, which is the loop that matters
+  while you work through the issues.
+
+Measured on 10 real entries exported from ADS, cache cold: **1.1 requests per
+entry**, down from 4.0. A 300-entry bibliography goes from ~1200 requests to ~330,
+which is roughly 15 full runs a day instead of 4.
+
+The bulk export is also the more correct one. The per-bibcode `GET` truncates long
+author lists to ten names and a literal `et al.` — the malformed author this tool
+warns about — so it both reported false `ADS_BIBTEX_MISMATCH`es against full author
+lists and offered `et al.` as a replacement. Every export now goes through the
+`POST` form, which returns the list in full.

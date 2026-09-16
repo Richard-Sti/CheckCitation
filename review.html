@@ -1,0 +1,620 @@
+<!doctype html><html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADS citation review</title>
+<style>
+/* --- tokens --- */
+:root {
+  --bg:#f6f6f4; --card:#fff; --ink:#1a1a1a; --dim:#6b6b6b; --line:#e2e2de;
+  --ok:#1f7a4d; --ok-bg:#e6f4ec;
+  --warn:#8a5a10; --warn-bg:#fbf1dd;
+  --bad:#b3261e; --bad-bg:#fbeae3;
+  --cold:#4a6b78; --cold-bg:#e7f0f3;
+}
+@media (prefers-color-scheme:dark) {
+  :root { --bg:#17181a; --card:#212327; --ink:#ececec; --dim:#9a9a9a; --line:#33353a;
+          --ok:#5cc98d; --ok-bg:#1b2f24;
+          --warn:#e0b169; --warn-bg:#332a1a;
+          --bad:#f2867a; --bad-bg:#33211a;
+          --cold:#8fb4c0; --cold-bg:#1e2a2e; }
+}
+* { box-sizing:border-box }
+[hidden] { display:none !important }
+body { margin:0; background:var(--bg); color:var(--ink);
+       font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif }
+code, pre, textarea { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace }
+
+/* --- header --- */
+header { position:sticky; top:0; z-index:5; background:var(--card); border-bottom:1px solid var(--line);
+         padding:10px 16px; display:flex; flex-wrap:wrap; gap:10px; align-items:center }
+h1 { font-size:16px; margin:0; font-weight:600 }
+#source { color:var(--dim); font-size:13px }
+nav { display:flex; gap:4px; flex-basis:100%; }
+nav button { background:none; border:0; border-bottom:2px solid transparent; color:var(--dim);
+             padding:6px 10px; font:inherit; cursor:pointer }
+nav button[aria-pressed="true"] { color:var(--ink); border-bottom-color:var(--ink) }
+nav b { font-weight:600; margin-left:5px; color:var(--dim); font-size:12px }
+.btn { background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:6px;
+       padding:5px 11px; font:inherit; cursor:pointer }
+.btn:hover:not(:disabled) { border-color:var(--dim) }
+.btn:disabled { opacity:.45; cursor:default }
+.btn.good { border-color:var(--ok); color:var(--ok) }
+.btn.danger { border-color:var(--bad); color:var(--bad) }
+.spacer { flex:1 }
+
+/* --- layout --- */
+main { max-width:860px; margin:0 auto; padding:14px 16px 64px }
+main:has(#view-all:not([hidden])) { max-width:1040px }
+#note { min-height:1.5em; margin:0 0 10px; color:var(--dim); font-size:13px }
+#note.err { color:var(--bad) }
+.lead { color:var(--dim); font-size:13px; margin:0 0 10px }
+.empty { color:var(--dim); font-style:italic }
+
+/* The 1px gap is the hairline between stats. */
+.stats { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line);
+         border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:14px }
+.stat { background:var(--card); padding:9px 12px }
+.stat b { display:block; font-size:19px; font-variant-numeric:tabular-nums; font-weight:600 }
+.stat span { font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim) }
+.stat.s-ok b { color:var(--ok) } .stat.s-bad b { color:var(--bad) }
+
+/* --- tags --- */
+.tag { display:inline-block; padding:1px 7px; border-radius:99px; font-size:11.5px; font-weight:600;
+       letter-spacing:.02em; white-space:nowrap }
+.tag.t-ok { color:var(--ok); background:var(--ok-bg) }
+.tag.t-warn { color:var(--warn); background:var(--warn-bg) }
+.tag.t-bad { color:var(--bad); background:var(--bad-bg) }
+.tag.t-cold { color:var(--cold); background:var(--cold-bg) }
+
+/* --- review card --- */
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:12px }
+.card h2 { margin:0 0 2px; font-size:17px; font-family:ui-monospace,Menlo,monospace }
+.meta { color:var(--dim); font-size:12.5px }
+.why { margin:10px 0; padding:9px 11px; border-radius:7px; background:var(--bg); font-size:13.5px }
+.why.t-bad { background:var(--bad-bg); color:var(--bad) }
+.why.t-warn { background:var(--warn-bg); color:var(--warn) }
+table { border-collapse:collapse; width:100% }
+th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top }
+th { font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); font-weight:600 }
+td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap }
+.diff td:first-child { color:var(--dim); width:74px; white-space:nowrap }
+.diff tr.clash td { background:var(--bad-bg) }
+.diff tr.clash td:first-child { color:var(--bad); font-weight:600 }
+.scroll { overflow-x:auto }
+textarea { width:100%; min-height:150px; padding:9px; border:1px solid var(--line); border-radius:7px;
+           background:var(--bg); color:var(--ink); font-size:12.5px; line-height:1.45; resize:vertical }
+.actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px }
+.keys { color:var(--dim); font-size:12px; margin:8px 0 0 }
+.confirm { background:var(--bad-bg); color:var(--bad); padding:8px 11px; border-radius:7px;
+           display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; font-size:13.5px }
+.handoff { background:var(--warn-bg); color:var(--warn); padding:9px 11px; border-radius:7px; font-size:13.5px }
+.handoff a, .card a { color:inherit }
+.recent li { font-size:13px; margin-bottom:3px }
+.recent code { font-size:12.5px }
+
+/* --- lists --- */
+.filters { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px }
+.filters button { background:none; border:1px solid var(--line); border-radius:99px; color:var(--dim);
+                  padding:3px 11px; font:inherit; font-size:13px; cursor:pointer }
+.filters button[aria-pressed="true"] { color:var(--ink); border-color:var(--ink) }
+.sort { display:block; color:var(--dim); font-size:12.5px; margin-bottom:8px }
+.sort select { font:inherit; font-size:13px; color:var(--ink); background:var(--card);
+               border:1px solid var(--line); border-radius:6px; padding:2px 6px }
+h3 { font-size:13.5px; margin:18px 0 6px }
+.plain { margin:0 0 6px; padding-left:20px }
+.plain li { font-size:13.5px }
+
+@media (prefers-reduced-motion:no-preference) { .card { transition:opacity .12s } }
+@media (max-width:620px) { .stats { grid-template-columns:repeat(2,1fr) } }
+</style>
+
+<header>
+  <h1>ADS citation review</h1>
+  <span id="source"></span>
+  <span class="spacer"></span>
+  <button class="btn" id="btn-recheck">Re-check</button>
+  <button class="btn" id="btn-reload" hidden>Reload from disk</button>
+  <nav>
+    <button id="tab-review" aria-pressed="true">Review<b id="n-review"></b></button>
+    <button id="tab-all" aria-pressed="false">All<b id="n-all"></b></button>
+    <button id="tab-check" aria-pressed="false">Cross-check<b id="n-check"></b></button>
+  </nav>
+</header>
+
+<main>
+  <p id="note" role="status"></p>
+
+  <div class="stats">
+    <div class="stat s-ok"><b id="s-ok">0</b><span>Agrees with ADS</span></div>
+    <div class="stat s-bad"><b id="s-issues">0</b><span>Needs a decision</span></div>
+    <div class="stat"><b id="s-replaced">0</b><span>Replaced</span></div>
+    <div class="stat"><b id="s-skipped">0</b><span>Not checked</span></div>
+  </div>
+
+  <section id="view-review">
+    <p class="lead">Entries ADS disagrees with, in file order. The citation key is always kept;
+      only the entry body is rewritten, behind one backup per session.</p>
+    <div id="card"></div>
+    <p class="empty" id="review-empty" hidden>Nothing left to decide.</p>
+    <h3 id="recent-head" hidden>Replaced this session</h3>
+    <ul class="recent plain" id="recent-rows"></ul>
+  </section>
+
+  <section id="view-all" hidden>
+    <p class="lead">Every entry in the file, including the ones the rules never flagged.</p>
+    <div class="filters">
+      <button data-filter="all" aria-pressed="true">All</button>
+      <button data-filter="issues" aria-pressed="false">Issues</button>
+      <button data-filter="ok" aria-pressed="false">Agrees with ADS</button>
+      <button data-filter="skip" aria-pressed="false">Skipped</button>
+    </div>
+    <label class="sort">Sort <select id="sort-all" data-sort aria-label="Sort entries"></select></label>
+    <div class="scroll" id="all-scroll">
+      <table>
+        <thead><tr><th>Key</th><th class="num">Line</th><th>Status</th><th>Title</th><th></th></tr></thead>
+        <tbody id="all-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="all-empty" hidden>No entries match this filter.</p>
+  </section>
+
+  <section id="view-check" hidden>
+    <p class="lead">Everything the report lists after the per-entry issues.</p>
+    <h3>Duplicates</h3>
+    <div id="dupe-rows"></div>
+    <h3>Warnings</h3>
+    <div id="warn-rows"></div>
+    <h3>TeX cross-check</h3>
+    <div id="tex-rows"></div>
+  </section>
+</main>
+
+<script>
+/* ---- pure helpers ---- */
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const TONE = {
+  OK:'ok', SKIPPED:'cold',
+  ADS_BIBTEX_MISMATCH:'warn', NON_ADS_BIBTEX:'warn',
+  RATE_LIMITED:'cold', ADS_UNVERIFIED_RATE_LIMITED:'cold', ERROR:'cold',
+};
+const tone = status => TONE[status] || 'bad';
+const label = status => status.toLowerCase().replace(/_/g, ' ');
+const tag = status => `<span class="tag t-${tone(status)}">${esc(label(status))}</span>`;
+
+const byKey = (entries, key) => entries.find(e => e.key === key) || null;
+
+// The queue is derived, never stored: an entry leaves it because the server says
+// it is OK now, not because the page remembered a click.
+function queueKeys(entries, dismissed, deferred, focus) {
+  const open = entries.filter(e => e.issueish && !dismissed.includes(e.key)).map(e => e.key);
+  const rank = key => focus.includes(key) ? 0 : deferred.includes(key) ? 2 : 1;
+  return open.slice().sort((a, b) => rank(a) - rank(b));
+}
+
+// Copy before sorting: a view must never reorder the underlying list.
+function sortRows(items, mode) {
+  const [field, direction] = mode.split(':');
+  const sign = direction === 'desc' ? -1 : 1;
+  const value = r => field === 'line' ? r.line : field === 'status' ? r.status : r.key;
+  return mode === 'default' ? items.slice() : items.slice().sort((a, b) => {
+    const x = value(a), y = value(b);
+    return sign * (field === 'line' ? x - y : String(x).localeCompare(String(y), 'en', {sensitivity:'base'}));
+  });
+}
+
+function matchesFilter(entry, filter) {
+  if (filter === 'issues') return entry.issueish;
+  if (filter === 'ok') return entry.status === 'OK';
+  if (filter === 'skip') return entry.skip;
+  return true;
+}
+
+const FIELDS = ['title', 'author', 'year', 'doi', 'eprint'];
+
+// Local against ADS, one row per field, clashing rows marked. This is the
+// side-by-side the CLI prints before it will accept a risky replacement.
+function diffTable(entry) {
+  if (!entry.ads) return '';
+  const rows = FIELDS.filter(f => entry.local[f] || entry.ads[f]).map(f => {
+    const clash = entry.conflicts.includes(f);
+    return `<tr class="${clash ? 'clash' : ''}"><td>${f}</td>` +
+      `<td>${esc(entry.local[f]) || '<i>—</i>'}</td><td>${esc(entry.ads[f]) || '<i>—</i>'}</td></tr>`;
+  }).join('');
+  return `<div class="scroll"><table class="diff">
+    <thead><tr><th></th><th>Local entry</th><th>ADS export</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function matchList(entry) {
+  if (!entry.matches.length) return '';
+  const rows = entry.matches.map(m =>
+    `<li><a href="${esc(m.url)}" target="_blank" rel="noreferrer"><code>${esc(m.bibcode)}</code></a> ` +
+    `${esc(m.year)} — ${esc(m.title)}</li>`).join('');
+  return `<h3>ADS returned ${entry.matches.length} record${entry.matches.length > 1 ? 's' : ''}</h3><ul class="plain">${rows}</ul>`;
+}
+
+// Nothing resolved, so the card stops proposing and starts helping the user look.
+function handoff(entry) {
+  if (!entry.search_url) return '';
+  return `<p class="handoff">No ADS route matched this entry. ` +
+    `<a href="${esc(entry.search_url)}" target="_blank" rel="noreferrer">Search ADS for it</a>, ` +
+    `then paste the BibTeX below.</p>`;
+}
+
+/* ---- page state ---- */
+const VIEWS = ['review', 'all', 'check'];
+const $ = id => document.getElementById(id);
+
+let entries = [], counts = [], dupes = [], warns = [], tex = null;
+let revision = null, replaced = 0, skipped = 0, source = '';
+let dismissed = [], deferred = [], focus = [], history = [];
+let drafts = {}, fetchedAuto = {}, blockedDrafts = false;
+let busy = false, stale = false, filter = 'all', confirming = null;
+let requestQueue = Promise.resolve();
+
+function draftKey() { return 'ads-review-drafts:' + source; }
+
+function readDrafts() {
+  try {
+    drafts = JSON.parse(localStorage.getItem(draftKey()) || '{}') || {};
+    if (typeof drafts !== 'object') drafts = {};
+  } catch (e) {
+    // Damaged storage is left exactly as it is; overwriting it is the one way
+    // to lose a pasted replacement for good.
+    drafts = {}; blockedDrafts = true;
+  }
+}
+
+function persistDrafts() {
+  if (blockedDrafts) return;
+  try { localStorage.setItem(draftKey(), JSON.stringify(drafts)); } catch (e) { blockedDrafts = true; }
+}
+
+function hasDrafts() { return Object.values(drafts).some(v => v && v.trim()); }
+
+function note(text, isError) {
+  const el = $('note');
+  el.textContent = text;
+  el.classList.toggle('err', !!isError);
+}
+
+function apiFetch(url, options = {}) {
+  const run = async () => {
+    const writing = options.method === 'POST';
+    if (writing && stale && url !== '/api/recheck') throw new Error('Reload from disk before retrying your edits.');
+    const res = await fetch(url, writing
+      ? {...options, headers: {'Content-Type': 'application/json', 'If-Match': revision || '', ...options.headers}}
+      : options);
+    const body = await res.json();
+    if (res.status === 409) { stale = true; $('btn-reload').hidden = false; }
+    if (res.ok && body.revision) {
+      revision = body.revision;
+      stale = false;
+      $('btn-reload').hidden = true;
+    }
+    return {ok: res.ok, status: res.status, body};
+  };
+  const result = requestQueue.then(run);
+  requestQueue = result.catch(() => {});
+  return result;
+}
+
+function adopt(payload) {
+  entries = payload.entries;
+  counts = payload.counts;
+  dupes = payload.duplicates;
+  warns = payload.warnings;
+  tex = payload.tex;
+  revision = payload.revision;
+  replaced = payload.replaced;
+  skipped = payload.skipped;
+  source = payload.source;
+  // Anything the server now calls settled cannot stay queued or deferred.
+  const live = new Set(entries.filter(e => e.issueish).map(e => e.key));
+  dismissed = dismissed.filter(k => live.has(k));
+  deferred = deferred.filter(k => live.has(k));
+  focus = focus.filter(k => live.has(k));
+}
+
+async function load() {
+  if (busy) return;
+  busy = true;
+  note('Loading…');
+  try {
+    const res = await apiFetch('/api/state');
+    if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
+    adopt(res.body);
+    readDrafts();
+    note(blockedDrafts ? 'Saved drafts could not be read; they were left untouched.' : '');
+  } catch (e) {
+    note(e.message, true);
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function recheck() {
+  if (busy) return;
+  busy = true;
+  note('Re-checking against ADS…');
+  try {
+    const res = await apiFetch('/api/recheck', {method: 'POST', body: '{}'});
+    if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
+    adopt(res.body);
+    note(res.body.notice || '');
+  } catch (e) {
+    note(e.message, true);
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function replace(key, bibtex) {
+  if (busy || !bibtex || !bibtex.trim()) return;
+  const entry = byKey(entries, key);
+  const previous = entry ? entry.raw : null;
+  busy = true;
+  confirming = null;
+  note(`Replacing ${key}…`);
+  try {
+    const res = await apiFetch('/api/replace', {method: 'POST', body: JSON.stringify({key, bibtex})});
+    if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
+    adopt(res.body);
+    if (previous) history.unshift({key, raw: previous});
+    // Only drop the draft once the server took it, and only if nothing was typed
+    // in the meantime.
+    if (drafts[key] === bibtex) { delete drafts[key]; persistDrafts(); }
+    note(res.body.notice || `${key} replaced.`);
+  } catch (e) {
+    note(e.message, true);
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function undo(index) {
+  const item = history[index];
+  if (!item || busy) return;
+  history.splice(index, 1);
+  await replace(item.key, item.raw);
+  note(`${item.key} restored to what was in the file.`);
+}
+
+async function fetchExport(key, bibcode) {
+  if (busy) return;
+  busy = true;
+  note(`Fetching the ADS export for ${bibcode}…`);
+  try {
+    const res = await apiFetch(`/api/bibtex?bibcode=${encodeURIComponent(bibcode)}&key=${encodeURIComponent(key)}`);
+    if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
+    drafts[key] = res.body.bibtex;
+    // The server vetted this export the same way a result that arrived with one
+    // is vetted, so a clean one is still a one-keypress replacement.
+    fetchedAuto[key] = !!res.body.auto;
+    persistDrafts();
+    note(`ADS export for ${bibcode} loaded; review it before replacing.`);
+  } catch (e) {
+    note(e.message, true);
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+/* ---- rendering ---- */
+function stats() {
+  const ok = entries.filter(e => e.status === 'OK').length;
+  $('s-ok').textContent = ok;
+  $('s-issues').textContent = entries.filter(e => e.issueish).length;
+  $('s-replaced').textContent = replaced;
+  $('s-skipped').textContent = skipped;
+  $('source').textContent = source;
+  $('n-review').textContent = queueKeys(entries, dismissed, deferred, focus).length || '';
+  $('n-all').textContent = entries.length || '';
+  $('n-check').textContent = (dupes.length + warns.length + (tex ? tex.undefined.length : 0)) || '';
+}
+
+function cardBody(entry) {
+  const draft = drafts[entry.key] ?? entry.ads_bibtex ?? '';
+  const risky = !(entry.auto || fetchedAuto[entry.key]);
+  const canFetch = !entry.ads_bibtex && entry.candidate && !drafts[entry.key];
+  return `<div class="card">
+    <h2>${esc(entry.key)}</h2>
+    <p class="meta">line ${entry.line} · ${tag(entry.status)}${entry.bibcode ? ' · <code>' + esc(entry.bibcode) + '</code>' : ''}</p>
+    <div class="why t-${tone(entry.status)}">${esc(entry.issue || entry.message)}</div>
+    ${entry.message && entry.issue ? `<p class="meta">${esc(entry.message)}</p>` : ''}
+    ${entry.conflicts.length ? `<p class="meta">ADS disagrees on: <b>${esc(entry.conflicts.join(', '))}</b></p>` : ''}
+    ${diffTable(entry)}
+    ${matchList(entry)}
+    ${handoff(entry)}
+    <h3>Replacement</h3>
+    <p class="meta">${esc(entry.action)}</p>
+    ${canFetch ? `<p><button class="btn" data-fetch="${esc(entry.key)}" data-bibcode="${esc(entry.candidate)}">Fetch the ADS export for ${esc(entry.candidate)}</button></p>` : ''}
+    <textarea id="bibtex" data-draft="${esc(entry.key)}" spellcheck="false"
+      placeholder="Paste the BibTeX you want here. The key ${esc(entry.key)} is kept whatever the pasted key says.">${esc(draft)}</textarea>
+    <div class="actions">
+      <button class="btn ${risky ? 'danger' : 'good'}" data-apply="${esc(entry.key)}" ${draft.trim() ? '' : 'disabled'}>
+        ${risky ? 'Replace anyway…' : 'Replace'}</button>
+      <button class="btn" data-keep="${esc(entry.key)}">Keep local</button>
+      <button class="btn" data-defer="${esc(entry.key)}">Defer</button>
+      ${history.length ? `<button class="btn" data-undo="0">Undo ${esc(history[0].key)}</button>` : ''}
+    </div>
+    ${confirming === entry.key ? `<div class="confirm">
+      This may be a different paper, not a formatting refresh. Replace <code>${esc(entry.key)}</code>?
+      <button class="btn danger" data-confirm="${esc(entry.key)}">Yes, replace</button>
+      <button class="btn" data-cancel="1">Cancel</button></div>` : ''}
+    <p class="keys">${risky
+      ? '← / h keep local · space defer · u undo. A risky replacement needs the button.'
+      : '→ / l replace · ← / h keep local · space defer · u undo'}</p>
+  </div>`;
+}
+
+function renderCard() {
+  const queue = queueKeys(entries, dismissed, deferred, focus);
+  const entry = queue.length ? byKey(entries, queue[0]) : null;
+  $('card').innerHTML = entry ? cardBody(entry) : '';
+  $('review-empty').hidden = !!entry;
+  $('recent-head').hidden = history.length === 0;
+  $('recent-rows').innerHTML = history.map((item, i) =>
+    `<li><code>${esc(item.key)}</code> <button class="btn" data-undo="${i}">Undo</button></li>`).join('');
+  wire($('card'));
+  wire($('recent-rows'));
+}
+
+function renderAll() {
+  const rows = sortRows(entries.filter(e => matchesFilter(e, filter)), $('sort-all').value);
+  const body = $('all-rows');
+  body.innerHTML = '';
+  $('all-empty').hidden = rows.length > 0;
+  $('all-scroll').hidden = rows.length === 0;
+  rows.forEach(entry => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><code>${esc(entry.key)}</code></td><td class="num">${entry.line}</td>` +
+      `<td>${tag(entry.status)}</td><td>${esc(entry.local.title)}</td>` +
+      `<td>${entry.issueish ? `<button class="btn" data-review="${esc(entry.key)}">Review</button>` : ''}</td>`;
+    body.appendChild(tr);
+  });
+  wire(body);
+}
+
+function renderCheck() {
+  $('dupe-rows').innerHTML = dupes.length
+    ? dupes.map(d => `<p><code>${esc(d.bibcode)}</code> — ${esc(d.title)}<br>` +
+        `<span class="meta">${d.keys.map(k => '<code>' + esc(k) + '</code>').join(', ')}</span></p>`).join('')
+    : '<p class="empty">No two entries resolve to the same ADS record.</p>';
+  $('warn-rows').innerHTML = warns.length
+    ? `<ul class="plain">${warns.map(w =>
+        `<li><code>${esc(w.key)}</code> (line ${w.line}) — ${esc(w.issue)}</li>`).join('')}</ul>`
+    : '<p class="empty">Nothing to warn about.</p>';
+  if (!tex) {
+    $('tex-rows').innerHTML = '<p class="empty">Pass --tex to cross-check which keys the paper actually cites.</p>';
+    return;
+  }
+  const part = (title, keys) => keys.length
+    ? `<h3>${title} (${keys.length})</h3><ul class="plain">${keys.map(k => '<li><code>' + esc(k) + '</code></li>').join('')}</ul>`
+    : '';
+  $('tex-rows').innerHTML =
+    `<p class="meta">${tex.sources.map(esc).join(', ')}</p>` +
+    (tex.unreadable.length ? `<p class="why t-bad">${tex.unreadable.map(esc).join('<br>')}</p>` : '') +
+    part('Cited but not in the .bib', tex.undefined) +
+    part('In the .bib but never cited', tex.uncited) +
+    (tex.undefined.length || tex.uncited.length ? '' : '<p class="empty">Every cited key is defined and every entry is cited.</p>');
+}
+
+function render() {
+  stats();
+  renderCard();
+  renderAll();
+  renderCheck();
+}
+
+/* ---- wiring ---- */
+function wire(container) {
+  if (!container || !container.querySelectorAll) return;
+  container.querySelectorAll('[data-apply]').forEach(el => el.onclick = () => {
+    const key = el.dataset.apply;
+    const entry = byKey(entries, key);
+    if (entry && !(entry.auto || fetchedAuto[key])) { confirming = key; render(); return; }
+    replace(key, currentDraft(key));
+  });
+  container.querySelectorAll('[data-confirm]').forEach(el =>
+    el.onclick = () => replace(el.dataset.confirm, currentDraft(el.dataset.confirm)));
+  container.querySelectorAll('[data-cancel]').forEach(el =>
+    el.onclick = () => { confirming = null; render(); });
+  container.querySelectorAll('[data-keep]').forEach(el =>
+    el.onclick = () => act('keep'));
+  container.querySelectorAll('[data-defer]').forEach(el =>
+    el.onclick = () => act('defer'));
+  container.querySelectorAll('[data-undo]').forEach(el =>
+    el.onclick = () => undo(Number(el.dataset.undo)));
+  container.querySelectorAll('[data-fetch]').forEach(el =>
+    el.onclick = () => fetchExport(el.dataset.fetch, el.dataset.bibcode));
+  container.querySelectorAll('[data-review]').forEach(el => el.onclick = () => {
+    const key = el.dataset.review;
+    dismissed = dismissed.filter(k => k !== key);
+    deferred = deferred.filter(k => k !== key);
+    focus = [key, ...focus.filter(k => k !== key)];
+    tab('review');
+    render();
+  });
+  container.querySelectorAll('[data-draft]').forEach(el => el.oninput = () => {
+    drafts[el.dataset.draft] = el.value;
+    persistDrafts();
+    const apply = container.querySelector('[data-apply]');
+    if (apply) apply.disabled = !el.value.trim();
+  });
+}
+
+function currentDraft(key) {
+  const box = $('bibtex');
+  if (box && box.dataset.draft === key) return box.value;
+  const entry = byKey(entries, key);
+  return drafts[key] ?? (entry ? entry.ads_bibtex : '') ?? '';
+}
+
+function act(what) {
+  const queue = queueKeys(entries, dismissed, deferred, focus);
+  if (!queue.length || busy) return;
+  const key = queue[0];
+  const entry = byKey(entries, key);
+  if (what === 'replace') {
+    if (!entry || !(entry.auto || fetchedAuto[key])) {
+      note('ADS disagrees with this entry, so it may be a different paper; use the button.', true);
+      return;
+    }
+    replace(key, currentDraft(key));
+    return;
+  }
+  focus = focus.filter(k => k !== key);
+  if (what === 'keep') dismissed = [...dismissed, key];
+  if (what === 'defer') deferred = [...deferred.filter(k => k !== key), key];
+  confirming = null;
+  render();
+}
+
+function tab(name) {
+  VIEWS.forEach(v => {
+    $('view-' + v).hidden = v !== name;
+    $('tab-' + v).setAttribute('aria-pressed', String(v === name));
+  });
+}
+
+VIEWS.forEach(v => $('tab-' + v).onclick = () => tab(v));
+
+document.querySelectorAll('[data-filter]').forEach(el => el.onclick = () => {
+  filter = el.dataset.filter;
+  document.querySelectorAll('[data-filter]').forEach(b =>
+    b.setAttribute('aria-pressed', String(b === el)));
+  render();
+});
+
+document.querySelectorAll('[data-sort]').forEach(select => {
+  const options = [['default', 'File order'], ['key:asc', 'Key: A–Z'], ['key:desc', 'Key: Z–A'],
+    ['line:asc', 'Line: first to last'], ['line:desc', 'Line: last to first'], ['status:asc', 'Status']];
+  select.replaceChildren(...options.map(([value, text]) => new Option(text, value)));
+  select.onchange = () => { if (!busy) render(); };
+});
+
+$('btn-recheck').onclick = e => { e.currentTarget.blur(); recheck(); };
+$('btn-reload').onclick = e => { e.currentTarget.blur(); load(); };
+
+addEventListener('keydown', e => {
+  if ($('view-review').hidden) return;
+  if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+  if (['BUTTON', 'SELECT', 'INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
+  if (e.key === 'ArrowRight' || e.key === 'l') act('replace');
+  if (e.key === 'ArrowLeft' || e.key === 'h') act('keep');
+  if (e.key === ' ') { e.preventDefault(); act('defer'); }
+  if (e.key === 'u') undo(0);
+});
+
+addEventListener('beforeunload', e => {
+  if (busy || hasDrafts()) e.preventDefault();
+});
+
+load();
+</script>
+</html>
