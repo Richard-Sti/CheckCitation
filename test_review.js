@@ -351,6 +351,20 @@ function entry(over = {}) {
   // An entry whose export genuinely differs is untouched by this.
   const differs = call('cardBody', entry({identical: false}));
   assert.ok(!differs.includes('identical to what is in the file'));
+  set('drafts = {};');
+  const keyOnly = call('cardBody', entry({
+    key: 'Hoffman2014', raw, ads_bibtex: raw, identical: true,
+    status: 'CITATION_KEY_CONFLICT', conflicts: ['key'], auto: false, candidate: '',
+  }));
+  assert.match(keyOnly, /only the key/, 'the card names the key as the thing to change');
+  assert.match(keyOnly, /rename the key/);
+  assert.match(keyOnly, /data-apply="Hoffman2014"\s+disabled/, 'and does not offer the ADS export');
+  set("drafts = {Hoffman2014: '@ARTICLE{Hoffman2014, title = {the record the key names}}'};");
+  assert.ok(!/data-apply="Hoffman2014"\s+disabled/.test(call('cardBody', entry({
+    key: 'Hoffman2014', raw, ads_bibtex: raw, identical: true,
+    status: 'CITATION_KEY_CONFLICT', conflicts: ['key'], auto: false, candidate: '',
+  }))), 'but pasting the record the key names is still allowed');
+  assert.equal(call('tone', 'CITATION_KEY_CONFLICT'), 'warn');
   console.log('ok: a replacement that would rewrite the same bytes is not offered');
 }
 

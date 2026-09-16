@@ -100,6 +100,7 @@ STATUS_ORDER = (
     "ADS_BIBTEX_MISMATCH",
     "NON_ADS_BIBTEX",
     "ADS_RECORD_CONFLICT",
+    "CITATION_KEY_CONFLICT",
     "IDENTIFIER_CONFLICT",
     "BIBCODE_MISMATCH",
     "IDENTIFIER_MISMATCH",
@@ -114,6 +115,7 @@ ISSUE_STATUSES = {
     "ADS_BIBTEX_MISMATCH",
     "NON_ADS_BIBTEX",
     "ADS_RECORD_CONFLICT",
+    "CITATION_KEY_CONFLICT",
     "IDENTIFIER_CONFLICT",
     "BIBCODE_MISMATCH",
     "IDENTIFIER_MISMATCH",
@@ -128,6 +130,7 @@ ISSUE_DESCRIPTIONS = {
     "ADS_BIBTEX_MISMATCH": "the local entry has ADS provenance, but its BibTeX fields differ from the current ADS export",
     "NON_ADS_BIBTEX": "the entry resolves to ADS, but it has no local ADS bibcode or adsurl",
     "ADS_RECORD_CONFLICT": "the resolved ADS record disagrees with the local entry on title, author, DOI, eprint, or citation key",
+    "CITATION_KEY_CONFLICT": "the entry itself matches the ADS record, but its citation key names a different first author or year",
     "IDENTIFIER_CONFLICT": "different identifiers in this entry resolve to different ADS records",
     "BIBCODE_MISMATCH": "the local ADS bibcode and DOI/arXiv/title lookup point to different ADS records",
     "IDENTIFIER_MISMATCH": "at least one identifier resolves to ADS, but another identifier in the same entry does not",
@@ -142,6 +145,7 @@ ISSUE_ACTIONS = {
     "ADS_BIBTEX_MISMATCH": "use --replace to review the ADS-exported replacement, or edit the local entry manually",
     "NON_ADS_BIBTEX": "use --replace to review adding the ADS-exported entry while keeping the citation key",
     "ADS_RECORD_CONFLICT": "use --replace to review the ADS-exported replacement, paste a manual replacement, or skip",
+    "CITATION_KEY_CONFLICT": "rename the citation key and every cite to it, or paste the record the key actually names; replacing the entry body would change nothing",
     "IDENTIFIER_CONFLICT": "use --replace to paste a reviewed replacement after deciding which identifier is intended",
     "BIBCODE_MISMATCH": "use --replace to paste a reviewed replacement after deciding whether the local ADS record or identifier-resolved record is intended",
     "IDENTIFIER_MISMATCH": "use --replace to review the ADS-exported replacement, paste a manual replacement, or skip",
@@ -161,6 +165,7 @@ ADS_REPLACEMENT_STATUSES = AUTOMATIC_REPLACEMENT_STATUSES | {
 HANDOFF_STATUSES = {"MISSING", "AMBIGUOUS", "NO_IDENTIFIER"}
 MANUAL_REPLACEMENT_STATUSES = {
     "ADS_RECORD_CONFLICT",
+    "CITATION_KEY_CONFLICT",
     "IDENTIFIER_CONFLICT",
     "BIBCODE_MISMATCH",
     "IDENTIFIER_MISMATCH",
@@ -1176,6 +1181,19 @@ def verify_ads_bibtex(
         return AdsResult("ERROR", result.query, result.matches, f"could not parse ADS BibTeX for {bibcode}")
 
     conflicts = identity_conflicts(entry, ads_entry)
+    if conflicts == ["key"]:
+        # The entry matches the record; only its key does not. Replacement cannot
+        # help - the key is kept by design - so this must not be offered as one.
+        return AdsResult(
+            "CITATION_KEY_CONFLICT",
+            result.query,
+            result.matches,
+            (
+                f"the entry matches ADS record {bibcode}, but the citation key {entry.key} "
+                f"names a different first author or year; renaming the key is the fix"
+            ),
+            ads_bibtex=ads_bibtex,
+        )
     if conflicts:
         return AdsResult(
             "ADS_RECORD_CONFLICT",
@@ -1244,7 +1262,7 @@ def propose_replacement(
     export itself agrees on title, author, DOI, eprint and key.
     """
     verified = verify_ads_bibtex(entry, bibcode, result, token, timeout, local_bibcode=False)
-    if verified.status in {"ERROR", "ADS_RECORD_CONFLICT"}:
+    if verified.status in {"ERROR", "ADS_RECORD_CONFLICT", "CITATION_KEY_CONFLICT"}:
         return verified
     return AdsResult("IDENTIFIER_MISMATCH", verified.query, verified.matches, reason, ads_bibtex=verified.ads_bibtex)
 

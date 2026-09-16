@@ -721,6 +721,37 @@ def test_an_arxiv_version_suffix_is_the_same_paper():
     assert identity_conflicts(local, ads_side) == []
 
 
+def test_a_key_only_disagreement_is_not_a_replacement():
+    """The key is kept by design, so replacing the body can never resolve this."""
+    local = entry(
+        """@ARTICLE{Hoffman2014, author = {{Hoffman}, Matthew D.},
+           title = {The No-U-Turn Sampler}, year = {2011}}"""
+    )
+    export = """@ARTICLE{2011arXiv1111.4246H, author = {{Hoffman}, Matthew D.},
+                title = {The No-U-Turn Sampler}, year = {2011}}"""
+    check_ads_bib.reset_ads_run_cache()
+    check_ads_bib.ADS_CACHE = None
+    with patch.object(check_ads_bib, "ads_export_bibtex", lambda *a, **k: export):
+        result = check_ads_bib.verify_ads_bibtex(
+            local, "2011arXiv1111.4246H",
+            AdsResult("OK", "q", [{"bibcode": "2011arXiv1111.4246H"}]), "token", 5,
+        )
+    assert result.status == "CITATION_KEY_CONFLICT", result.status
+    assert check_ads_bib.ads_replacement_bibcode(result) is None, "the ADS export must not be offered"
+    assert result.status in check_ads_bib.MANUAL_REPLACEMENT_STATUSES, "pasting another record must still be allowed"
+    assert result.ads_bibtex, "the side-by-side still needs the export"
+
+    # A conflict that is not only the key keeps its old status and its replacement.
+    wrong = entry("""@ARTICLE{Hoffman2014, author = {{Hoffman}, M.}, title = {Something else entirely}, year = {2011}}""")
+    with patch.object(check_ads_bib, "ads_export_bibtex", lambda *a, **k: export):
+        other = check_ads_bib.verify_ads_bibtex(
+            wrong, "2011arXiv1111.4246H",
+            AdsResult("OK", "q", [{"bibcode": "2011arXiv1111.4246H"}]), "token", 5,
+        )
+    assert other.status == "ADS_RECORD_CONFLICT", other.status
+    assert check_ads_bib.ads_replacement_bibcode(other) == "2011arXiv1111.4246H"
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

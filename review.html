@@ -193,6 +193,7 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 
 const TONE = {
   OK:'ok', SKIPPED:'cold',
+  CITATION_KEY_CONFLICT:'warn',
   ADS_BIBTEX_MISMATCH:'warn', NON_ADS_BIBTEX:'warn',
   RATE_LIMITED:'cold', ADS_UNVERIFIED_RATE_LIMITED:'cold', ERROR:'cold',
 };
@@ -550,9 +551,12 @@ function cardBody(entry) {
     ${matchList(entry)}
     ${currentEntry(entry)}
     ${handoff(entry)}
-    ${entry.identical ? `<p class="handoff">The ADS export is identical to what is in the file, so replacing it
+    ${entry.status === 'CITATION_KEY_CONFLICT' ? `<p class="handoff">The entry matches ADS; only the key
+      <code>${esc(entry.key)}</code> does not. Renaming it means renaming every <code>\\cite{}</code> to it, so this
+      one is yours: rename the key, or paste the record the key actually names. Replacing the body would
+      change nothing.</p>` : entry.identical ? `<p class="handoff">The ADS export is identical to what is in the file, so replacing it
       would change nothing. ${entry.conflicts.length
-        ? `ADS disagrees on <b>${esc(entry.conflicts.join(', '))}</b>, which the entry body cannot fix — correct that field, or the citation key, by hand.`
+        ? `ADS disagrees on <b>${esc(entry.conflicts.join(', '))}</b>, which the entry body cannot fix — correct that field by hand.`
         : 'The disagreement is in the identifiers, not the entry body — correct those by hand.'}</p>` : ''}
     <h3>Proposed replacement</h3>
     <p class="meta">${esc(entry.action)}</p>

@@ -172,7 +172,11 @@ but their series numbering has to match exactly: `Paper I` and `Paper II` score
 The citation key check is the only signal independent of the entry's own fields:
 a key of the form `Surname2020` is compared against the record's first author and
 year, which is what catches an entry that is internally consistent but is simply
-the wrong paper. A survey or collaboration key names the project rather than the
+the wrong paper. When that is the *only* disagreement the entry is reported
+`CITATION_KEY_CONFLICT` and **no replacement is offered**: the citation key is kept
+by design, so rewriting the body could only ever produce the same file. Renaming
+the key means renaming every `\cite{}` to it, so that decision stays yours — or
+paste the record the key actually names, which is still allowed. A survey or collaboration key names the project rather than the
 author — `CosmoVerse2025` resolves to a paper by Di Valentino — so a key of four
 characters or more that appears in the record's title is accepted as well. Disagreement is reported as `ADS_RECORD_CONFLICT` and the entry
 is never offered as a one-keypress replacement.
