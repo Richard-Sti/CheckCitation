@@ -550,13 +550,18 @@ function cardBody(entry) {
     ${matchList(entry)}
     ${currentEntry(entry)}
     ${handoff(entry)}
+    ${entry.identical ? `<p class="handoff">The ADS export is identical to what is in the file, so replacing it
+      would change nothing. ${entry.conflicts.length
+        ? `ADS disagrees on <b>${esc(entry.conflicts.join(', '))}</b>, which the entry body cannot fix — correct that field, or the citation key, by hand.`
+        : 'The disagreement is in the identifiers, not the entry body — correct those by hand.'}</p>` : ''}
     <h3>Proposed replacement</h3>
     <p class="meta">${esc(entry.action)}</p>
     ${canFetch ? `<p><button class="btn" data-fetch="${esc(entry.key)}" data-bibcode="${esc(entry.candidate)}">Fetch the ADS export for ${esc(entry.candidate)}</button></p>` : ''}
     <textarea id="bibtex" data-draft="${esc(entry.key)}" spellcheck="false"
       placeholder="Paste the BibTeX you want here. The key ${esc(entry.key)} is kept whatever the pasted key says.">${esc(draft)}</textarea>
     <div class="actions">
-      <button class="btn ${risky ? 'danger' : 'good'}" data-apply="${esc(entry.key)}" ${draft.trim() ? '' : 'disabled'}>
+      <button class="btn ${risky ? 'danger' : 'good'}" data-apply="${esc(entry.key)}"
+        ${draft.trim() && !(entry.identical && draft.trim() === (entry.ads_bibtex || '').trim()) ? '' : 'disabled'}>
         ${risky ? 'Replace anyway…' : 'Replace'}</button>
       <button class="btn" data-keep="${esc(entry.key)}">Checked, it is fine</button>
       <button class="btn" data-defer="${esc(entry.key)}">Defer</button>

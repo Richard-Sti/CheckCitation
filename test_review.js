@@ -59,7 +59,7 @@ function entry(over = {}) {
     local: {title: 'A study', author: 'Smith, J.', year: '2020', doi: '', eprint: ''},
     bibcode: '2020ApJ...900....1S', ads: null, ads_bibtex: '@ARTICLE{Smith2020, title = {A}}',
     conflicts: [], matches: [], candidate: '2020ApJ...900....1S', search_url: '',
-    auto: true, manual: false, issueish: true, accepted: false, skip: false, ...over,
+    auto: true, manual: false, issueish: true, accepted: false, identical: false, skip: false, ...over,
   };
 }
 
@@ -163,12 +163,12 @@ function entry(over = {}) {
   const lazy = call('cardBody', entry({ads_bibtex: '', status: 'IDENTIFIER_MISMATCH', auto: false}));
   assert.match(lazy, /data-fetch="Smith2020" data-bibcode="2020ApJ\.\.\.900\.\.\.\.1S"/,
     'an ADS candidate with no export yet must be fetchable');
-  assert.match(lazy, /data-apply="Smith2020" disabled/, 'and Replace stays disabled until there is text');
+  assert.match(lazy, /data-apply="Smith2020"\s+disabled/, 'and Replace stays disabled until there is text');
 
   set("drafts = {Smith2020: '@ARTICLE{Smith2020, title = {pasted}}'};");
   const pasted = call('cardBody', entry({ads_bibtex: '', auto: false}));
   assert.ok(pasted.includes('pasted'), 'a draft outranks the proposal');
-  assert.ok(!/data-apply="Smith2020" disabled/.test(pasted), 'and enables Replace');
+  assert.ok(!/data-apply="Smith2020"\s+disabled/.test(pasted), 'and enables Replace');
   console.log('ok: a lazily fetched or pasted replacement drives the buttons');
 }
 
@@ -325,6 +325,34 @@ function entry(over = {}) {
   assert.match(nodes.note.textContent, /0 saved before it/);
   console.log('ok: a refused save reports which entry and why, not "Saved 0"');
 })().catch(e => { console.error(e); process.exitCode = 1; });
+
+/* ---- a replacement that would change nothing is not offered ---- */
+{
+  const {call, set} = page();
+  set('drafts = {}; fetchedAuto = {}; vetted = {}; confirming = null; history = [];');
+  const raw = '@ARTICLE{Hoffman2014,\n  title = {NUTS}\n}';
+  const same = call('cardBody', entry({
+    key: 'Hoffman2014', raw, ads_bibtex: raw, identical: true,
+    status: 'ADS_RECORD_CONFLICT', conflicts: ['key'], auto: false,
+  }));
+  assert.match(same, /identical to what is in the file/, 'the card has to say the replacement is a no-op');
+  assert.match(same, /ADS disagrees on <b>key<\/b>/, 'and name what actually has to change');
+  assert.match(same, /data-apply="Hoffman2014"\s+disabled/, 'and not invite the click');
+  assert.match(same, /data-keep="Hoffman2014"/, 'Checked and Defer still work');
+
+  // Typing something different re-enables it.
+  set("drafts = {Hoffman2014: '@ARTICLE{Hoffman2014, title = {something else}}'};");
+  const edited = call('cardBody', entry({
+    key: 'Hoffman2014', raw, ads_bibtex: raw, identical: true,
+    status: 'ADS_RECORD_CONFLICT', conflicts: ['key'], auto: false,
+  }));
+  assert.ok(!/data-apply="Hoffman2014"\s+disabled/.test(edited), 'a real edit is still applicable');
+
+  // An entry whose export genuinely differs is untouched by this.
+  const differs = call('cardBody', entry({identical: false}));
+  assert.ok(!differs.includes('identical to what is in the file'));
+  console.log('ok: a replacement that would rewrite the same bytes is not offered');
+}
 
 /* ---- the handoff, for entries no route resolved ---- */
 {

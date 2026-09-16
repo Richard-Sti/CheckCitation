@@ -546,6 +546,29 @@ def test_a_store_that_cannot_be_written_is_not_reported_as_saved():
         assert item.payload()["accepted_error"] == item.accepted_error, "the page has to be told"
 
 
+def test_an_entry_that_already_is_the_ads_export_offers_no_replacement():
+    """Clicking Replace here rewrites the same bytes: nothing changes, and the real
+    disagreement - a citation key, a bad eprint - is not something a body can fix."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "ref.bib"
+        path.write_text(BIB)
+        entry = next(e for e in check_ads_bib.parse_bibtex(path) if e.key == "Smith2020")
+        # The export is exactly what is already in the file.
+        export = entry.raw.replace("@ARTICLE{Smith2020,", "@ARTICLE{2020ApJ...900....1S,")
+        statuses = {
+            "Smith2020": result("ADS_RECORD_CONFLICT", matches=[{"bibcode": "2020ApJ...900....1S"}], ads_bibtex=export),
+            "Jones2019": result("OK", matches=[{"bibcode": "2019ApJ...800....2J"}]),
+        }
+        item = session(tmp, statuses)
+        smith = {e["key"]: e for e in item.payload()["entries"]}["Smith2020"]
+        assert smith["identical"] is True, "the proposal is the file; the card must say so"
+        assert smith["ads_bibtex"].strip() == entry.raw.strip()
+
+        # An entry whose export really does differ is unaffected.
+        other = {e["key"]: e for e in session(tmp, MISMATCH).payload()["entries"]}["Smith2020"]
+        assert other["identical"] is False
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

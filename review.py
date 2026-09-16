@@ -292,6 +292,7 @@ def describe(entry, result, accepted=False):
     ads_entry = ads.parsed_ads_entry(entry, result.ads_bibtex) if result.ads_bibtex else None
     conflicts = ads.identity_conflicts(entry, ads_entry) if ads_entry else []
     candidate = ads.ads_replacement_bibcode(result)
+    proposal = ads.replace_bibtex_key(result.ads_bibtex, entry.key) if result.ads_bibtex else ""
     return {
         "key": entry.key,
         "kind": entry.kind,
@@ -305,7 +306,10 @@ def describe(entry, result, accepted=False):
         "local": {field: entry.fields.get(field, "") for field in ADS_FIELDS},
         "bibcode": ads.ads_bibcode(entry) or "",
         "ads": {field: ads_entry.fields.get(field, "") for field in ADS_FIELDS} if ads_entry else None,
-        "ads_bibtex": ads.replace_bibtex_key(result.ads_bibtex, entry.key) if result.ads_bibtex else "",
+        "ads_bibtex": proposal,
+        # The entry already is the ADS export: whatever ADS disagrees with is
+        # something a replacement cannot touch, so the card must not offer one.
+        "identical": bool(proposal) and proposal.strip() == entry.raw.strip(),
         "conflicts": conflicts,
         "matches": [
             {
@@ -350,6 +354,7 @@ def skipped_entry(entry):
         "conflicts": [],
         "matches": [],
         "candidate": "",
+        "identical": False,
         "search_url": "",
         "auto": False,
         "manual": False,
