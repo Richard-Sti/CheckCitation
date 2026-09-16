@@ -13,6 +13,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -66,14 +67,23 @@ ENTRY_RE = re.compile(r"@(?P<kind>[A-Za-z]+)\s*{\s*(?P<key>[^,\s]+)\s*,", re.M)
 FIELD_RE = re.compile(r"(?P<name>[A-Za-z][A-Za-z0-9_-]*)\s*=", re.M)
 SKIP_DIRECTIVE_RE = re.compile(r"^\s*%+\s*checkcitation:\s*skip\b", re.I)
 LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+\s*")
+# `\i` and `\ss` are letters, not commands. Stripping them alongside \ensuremath
+# turns Antol{\'\i}nez into "antolnez", which then agrees with no citation key and
+# quietly lowers every title score it appears in. The lookahead keeps \lambda and
+# \odot out of it.
+LATEX_LETTER_RE = re.compile(r"\\(AE|OE|ae|oe|ss|aa|AA|i|j|l|L|o|O)(?![A-Za-z])")
+LATEX_LETTERS = {"aa": "a", "AA": "A"}  # \aa is a-ring; the rest already spell themselves
 NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
 AUTHOR_SPLIT_RE = re.compile(r"\s+and\s+", re.I)
 # "1105--1134" cites page 1105; "A6" is already the whole locator.
 FIRST_PAGE_RE = re.compile(r"^[A-Za-z]?\d+")
 # `0.8 2020A&A...641A...6P -- Planck Collaboration 2020, A&A, 641, A6`
 RESOLVED_RE = re.compile(r"^(?P<score>[\d.]+)\s+(?P<bibcode>\S+)\s+--\s")
-# Surname plus a four-digit year, optionally disambiguated (Dutton2007a).
-CITATION_KEY_RE = re.compile(r"^(?P<name>[A-Za-z][A-Za-z'\-]*)(?P<year>\d{4})[a-z]?$")
+# Surname plus a four-digit year, optionally separated and disambiguated:
+# Dutton2007a, Riess_2022, Stiskalek_2026B. The separator is not cosmetic - a
+# whole bibliography written `Surname_Year` otherwise reads as zero keys, and
+# switches off the only check independent of the entry's own fields.
+CITATION_KEY_RE = re.compile(r"^(?P<name>[A-Za-z][A-Za-z'\-]*)[_.\-]?(?P<year>\d{4})[A-Za-z]?$")
 CITE_RE = re.compile(r"\\[A-Za-z]*cite[A-Za-z]*\*?\s*(?:\[[^\]]*\]\s*)*\{(?P<keys>[^}]*)\}")
 TEX_COMMENT_RE = re.compile(r"(?<!\\)%.*")
 # ponytail: 0.85 on an alphanumeric reduction; tighten only if real mismatches slip through.
@@ -88,6 +98,7 @@ NON_ENTRY_KINDS = {"comment", "string", "preamble"}
 # duplicate. For AMBIGUOUS or ERROR, matches[0] is just the top hit.
 RESOLVED_STATUSES = {
     "OK",
+    "PREPRINT_PUBLISHED",
     "ADS_BIBTEX_MISMATCH",
     "NON_ADS_BIBTEX",
     "ADS_RECORD_CONFLICT",
@@ -98,6 +109,7 @@ ARXIV_PREFIX_RE = re.compile(r"^arxiv:", re.I)
 ARXIV_VERSION_RE = re.compile(r"v\d+$")
 STATUS_ORDER = (
     "OK",
+    "PREPRINT_PUBLISHED",
     "ADS_BIBTEX_MISMATCH",
     "NON_ADS_BIBTEX",
     "ADS_RECORD_CONFLICT",
@@ -113,6 +125,7 @@ STATUS_ORDER = (
     "ERROR",
 )
 ISSUE_STATUSES = {
+    "PREPRINT_PUBLISHED",
     "ADS_BIBTEX_MISMATCH",
     "NON_ADS_BIBTEX",
     "ADS_RECORD_CONFLICT",
@@ -128,6 +141,7 @@ ISSUE_STATUSES = {
     "ERROR",
 }
 ISSUE_DESCRIPTIONS = {
+    "PREPRINT_PUBLISHED": "the entry cites an arXiv preprint, and ADS holds the published paper under a separate record",
     "ADS_BIBTEX_MISMATCH": "the local entry has ADS provenance, but its BibTeX fields differ from the current ADS export",
     "NON_ADS_BIBTEX": "the entry resolves to ADS, but it has no local ADS bibcode or adsurl",
     "ADS_RECORD_CONFLICT": "the resolved ADS record disagrees with the local entry on title, author, DOI, eprint, or citation key",
@@ -143,6 +157,7 @@ ISSUE_DESCRIPTIONS = {
     "ERROR": "an ADS request or local worker failed before the entry could be checked",
 }
 ISSUE_ACTIONS = {
+    "PREPRINT_PUBLISHED": "use --replace to review the published record and cite it instead, or keep the preprint on purpose",
     "ADS_BIBTEX_MISMATCH": "use --replace to review the ADS-exported replacement, or edit the local entry manually",
     "NON_ADS_BIBTEX": "use --replace to review adding the ADS-exported entry while keeping the citation key",
     "ADS_RECORD_CONFLICT": "use --replace to review the ADS-exported replacement, paste a manual replacement, or skip",
@@ -158,13 +173,18 @@ ISSUE_ACTIONS = {
     "ERROR": "rerun later; if this repeats, inspect the reported request error",
 }
 AUTOMATIC_REPLACEMENT_STATUSES = {"ADS_BIBTEX_MISMATCH", "NON_ADS_BIBTEX"}
+# Where a preprint is worth a second look: the record it names is not in dispute,
+# so a published counterpart is news rather than one more thing already wrong.
+PREPRINT_UPGRADE_STATUSES = AUTOMATIC_REPLACEMENT_STATUSES | {"OK"}
 ADS_REPLACEMENT_STATUSES = AUTOMATIC_REPLACEMENT_STATUSES | {
+    "PREPRINT_PUBLISHED",
     "ADS_RECORD_CONFLICT",
     "IDENTIFIER_MISMATCH",
 }
 # Nothing resolved, so the tool has done all it can and the user takes over.
 HANDOFF_STATUSES = {"MISSING", "AMBIGUOUS", "NO_IDENTIFIER"}
 MANUAL_REPLACEMENT_STATUSES = {
+    "PREPRINT_PUBLISHED",
     "ADS_RECORD_CONFLICT",
     "CITATION_KEY_CONFLICT",
     "IDENTIFIER_CONFLICT",
@@ -721,9 +741,12 @@ def urlopen_with_retries(request: urllib.request.Request, timeout: float) -> byt
     raise RuntimeError("unreachable retry state")
 
 
+ADS_SEARCH_FIELDS = "bibcode,title,year,doi,identifier,pub"
+
+
 def ads_search(query: str, token: str, rows: int, timeout: float, sleep: float = 0.0) -> list[dict[str, object]]:
     cache_key = json.dumps(
-        {"fl": "bibcode,title,year,doi,identifier", "query": query, "rows": rows},
+        {"fl": ADS_SEARCH_FIELDS, "query": query, "rows": rows},
         sort_keys=True,
     )
     cached = ads_cached_value("search", cache_key)
@@ -742,7 +765,7 @@ def ads_search(query: str, token: str, rows: int, timeout: float, sleep: float =
         params = urllib.parse.urlencode(
             {
                 "q": query,
-                "fl": "bibcode,title,year,doi,identifier",
+                "fl": ADS_SEARCH_FIELDS,
                 "rows": str(rows),
             }
         )
@@ -955,10 +978,14 @@ def parsed_ads_entry(entry: BibEntry, ads_bibtex: str) -> BibEntry | None:
 
 
 def normalized_identity_value(value: str) -> str:
+    value = LATEX_LETTER_RE.sub(lambda m: LATEX_LETTERS.get(m.group(1), m.group(1)), value)
     value = LATEX_COMMAND_RE.sub(" ", value)  # \ensuremath, \sc, \textit, \approx
     value = re.sub(r"\\(.)", r"\1", value)  # \&, \_, \%
     for char in "{}$":
         value = value.replace(char, " ")
+    # Decompose, then drop the combining marks: a literal "í" is otherwise thrown
+    # away whole by NON_ALNUM_RE, exactly like the LaTeX spelling of it was.
+    value = "".join(ch for ch in unicodedata.normalize("NFKD", value) if not unicodedata.combining(ch))
     return " ".join(value.casefold().split())
 
 
@@ -1104,6 +1131,20 @@ def identity_conflicts(entry: BibEntry, ads_entry: BibEntry) -> list[str]:
     return conflicts
 
 
+def cites_a_preprint(entry: BibEntry) -> bool:
+    """True when the entry names an arXiv record rather than a published one."""
+    if is_arxiv_bibcode(ads_bibcode(entry) or ""):
+        return True
+    if bare_doi(entry.fields.get("doi", "")).casefold().startswith("10.48550/arxiv"):
+        return True
+    return alphanumeric_key(entry.fields.get("journal", "")) == "arxiveprints"
+
+
+def record_venue(match: dict[str, object]) -> str:
+    """Where ADS says the record was published, spelled out rather than as `\\aap`."""
+    return " ".join(str(match.get(field, "")).strip() for field in ("pub", "year")).strip()
+
+
 def malformed_author(entry: BibEntry) -> bool:
     """True for a literal `{et al.}` author, which renders as `(Smith & et al. 2020)`."""
     author = entry.fields.get("author", "")
@@ -1210,6 +1251,19 @@ def verify_ads_bibtex(
                 f"the entry matches ADS record {bibcode}, but the citation key {entry.key} "
                 f"names a different first author or year; renaming the key is the fix"
             ),
+            ads_bibtex=ads_bibtex,
+        )
+    if conflicts and not set(conflicts) - {"doi", "eprint"} and cites_a_preprint(entry) and not is_arxiv_bibcode(bibcode):
+        # ADS merged the preprint into the journal record, so the entry's own
+        # identifiers land on it and only the arXiv DOI/eprint disagree. That is
+        # the same news as an unmerged pair, not a hint of a different paper.
+        venue = record_venue(result.matches[0]) if result.matches else ""
+        return AdsResult(
+            "PREPRINT_PUBLISHED",
+            result.query,
+            result.matches,
+            f"the entry cites the arXiv preprint, but ADS resolves it to the published record {bibcode}"
+            + (f" ({venue})" if venue else ""),
             ads_bibtex=ads_bibtex,
         )
     if conflicts:
@@ -1343,6 +1397,69 @@ def with_fallback(
     )
 
 
+def published_upgrade(
+    entry: BibEntry,
+    result: AdsResult,
+    token: str,
+    rows: int,
+    timeout: float,
+    sleep: float,
+) -> AdsResult | None:
+    """The refereed record for an entry still citing the preprint, or None.
+
+    ADS eventually folds an arXiv record into the journal one, and `preferred_match`
+    handles that case for free. Until it does, both records exist separately and the
+    preprint resolves perfectly: every identifier agrees, every field agrees, and
+    nothing at all says the paper is out. Only a title search finds the other record.
+    """
+    if result.status not in PREPRINT_UPGRADE_STATUSES or not result.matches:
+        return None
+    if not is_arxiv_bibcode(str(result.matches[0].get("bibcode", ""))):
+        return None
+    title = entry.fields.get("title", "")
+    if not title:
+        return None
+
+    query = f'title:"{escape_query_value(normalized_identity_value(title))}"'
+    try:
+        matches, failure = ads_search_guarded("published", query, token, rows, timeout, sleep)
+        if failure is not None:
+            return None
+        published = [
+            match
+            for match in matches
+            if not is_arxiv_bibcode(str(match.get("bibcode", "")))
+            and alphanumeric_key(match_title(match)) == alphanumeric_key(title)
+        ]
+        if len(published) != 1:
+            return None
+        bibcode = str(published[0].get("bibcode", ""))
+        ads_bibtex = ads_export_bibtex(bibcode, token, timeout)
+    except (AdsRateLimitError, RuntimeError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        # A verdict the entry has already earned must not be downgraded because
+        # the extra lookup failed; the next run asks again.
+        return None
+
+    ads_entry = parsed_ads_entry(entry, ads_bibtex)
+    if ads_entry is None:
+        return None
+    # The DOI and eprint are meant to differ - that is the whole point - so only a
+    # disagreement that publication cannot explain rules the record out.
+    if [conflict for conflict in identity_conflicts(entry, ads_entry) if conflict not in {"doi", "eprint"}]:
+        return None
+
+    venue = record_venue(published[0])
+    return AdsResult(
+        "PREPRINT_PUBLISHED",
+        query,
+        published,
+        f"the entry cites the arXiv preprint, but this paper is published as {bibcode}"
+        + (f" ({venue})" if venue else "")
+        + "; ADS has not merged the two records",
+        ads_bibtex=ads_bibtex,
+    )
+
+
 def check_entry_live(entry: BibEntry, token: str, rows: int, timeout: float, sleep: float) -> AdsResult:
     local_bibcode = ads_bibcode(entry)
     identifiers = local_identifiers(entry)
@@ -1380,7 +1497,8 @@ def check_entry(
     sleep: float,
 ) -> AdsResult:
     try:
-        return check_entry_live(entry, token, rows, timeout, sleep)
+        result = check_entry_live(entry, token, rows, timeout, sleep)
+        return published_upgrade(entry, result, token, rows, timeout, sleep) or result
     except AdsRateLimitError as exc:
         return rate_limited_result(entry, exc.wait)
 
@@ -2102,9 +2220,10 @@ def print_report(results: list[tuple[BibEntry, AdsResult]], verbose: bool) -> in
 
     total = len(results)
     print("\nSummary")
-    print(f"  {'entries':<13} {total}")
+    width = max([13, *(len(status) for status in counts)])
+    print(f"  {'entries':<{width}} {total}")
     for status, count in ordered_counts(counts):
-        print(f"  {status:<13} {count}")
+        print(f"  {status:<{width}} {count}")
 
     issue_results = [(entry, result) for entry, result in results if result.status in ISSUE_STATUSES]
     if issue_results:

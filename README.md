@@ -177,6 +177,12 @@ but their series numbering has to match exactly: `Paper I` and `Paper II` score
 0.99 on a character ratio and are not the same paper.
 The citation key check is the only signal independent of the entry's own fields:
 a key of the form `Surname2020` is compared against the record's **first author**,
+and the separator styles are all read — `Riess_2022`, `Riess-2022`, `Riess2022a`,
+`Stiskalek_2026B`. That is not cosmetic: a bibliography written `Surname_Year`
+throughout otherwise parses as *zero* keys, and the check silently does nothing
+for the whole file. Names are folded before they are compared, in both spellings
+a `.bib` uses: `Antol{\'\i}nez` and `Antolínez` both reduce to `antolinez`, so
+neither reads as a different author from the key `Balaguera-Antolinez_2019`.
 which is what catches an entry that is internally consistent but is simply the
 wrong paper. When that is the only disagreement the entry is reported
 `CITATION_KEY_CONFLICT` and **no replacement is offered**: the citation key is kept
@@ -198,6 +204,31 @@ line number, reason, matching ADS records when available, and suggested action.
 It then lists `Duplicates` (two keys resolving to the same record) and
 `Warnings` (such as a literal `{et al.}` author, which renders as
 `(Koribalski & et al. 2020)`).
+
+An entry that cites an arXiv preprint of a paper that is now out is reported
+`PREPRINT_PUBLISHED`, with the published record's BibTeX as the proposed
+replacement. There are two halves to that case, and the tool has to catch both:
+
+- **ADS merged the two records.** The entry's own identifiers resolve straight to
+  the journal record, and only the arXiv DOI and eprint disagree with it. That
+  used to be `ADS_RECORD_CONFLICT` — "may be a different paper" — which is both
+  alarming and wrong: it is the *same* paper, and the DOI is supposed to differ.
+- **ADS has not merged them.** Both records exist separately, so the preprint
+  resolves *perfectly*: every identifier agrees, every field agrees, and nothing
+  in the entry says the paper was ever published. Only a title search finds the
+  other record, so entries resolving to an arXiv bibcode get one.
+
+Either way, the DOI and eprint are *meant* to differ and are not counted against
+the record — but anything publication cannot explain, a different title or a
+different first author, and the upgrade is dropped and the entry keeps the
+verdict it had. It is never a one-keypress replacement: the identifiers change,
+so it takes the same button and inline confirmation as anything else that might
+be a different paper. Keeping the preprint on purpose is a decision the app
+records like any other.
+
+What this cannot see is a paper published where ADS does not index it — JMLR,
+most Springer chapters — or one whose title was reworded past recognition on the
+way to the journal. ADS is the only thing being asked.
 
 Books and conference proceedings often resolve through the reference resolver —
 `Jeffreys, H. 1939, Theory of Probability` finds `1939thpr.book.....J` — so try a
@@ -275,6 +306,9 @@ is spending fewer requests per entry:
 - **One export request per hundred entries, not one per entry.** Every bibcode the
   file already names is exported in bulk before the check starts, and the per-entry
   path then finds it in the cache.
+- **One extra search per arXiv entry**, and only per arXiv entry, to find the
+  published record ADS has not merged yet. Twelve preprints in a 114-entry
+  bibliography cost twelve requests, once, and then the cache holds them.
 - **Re-runs cost nothing** inside the one-month window, which is the loop that matters
   while you work through the issues.
 

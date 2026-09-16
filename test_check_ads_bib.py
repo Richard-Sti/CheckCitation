@@ -71,6 +71,43 @@ def test_wrong_paper_is_flagged():
     assert identity_conflicts(local, ads) == ["key"], identity_conflicts(local, ads)
 
 
+def test_accented_surnames_survive_normalisation():
+    """`\\i` is a letter, not a command. Eating it made Antol{\\'\\i}nez read as
+    `antolnez`, which agrees with no citation key and no ADS author."""
+    for spelling in ("{Balaguera-Antol{\\'\\i}nez}, A.", "Balaguera-Antol\u00ednez, A."):
+        assert first_author_surname(spelling) == "balagueraantolinez", spelling
+    assert first_author_surname("{Str{\\o}mgren}, B.") == "stromgren"
+    assert first_author_surname("{Wo{\\l}czyk}, A.") == "wolczyk"
+    assert first_author_surname("{Wei{\\ss}}, A.") == "weiss"
+    assert first_author_surname("{N{\\'a}jera}, J.") == "najera"
+    # A real key that used to be reported as naming a different first author.
+    ads = parsed_ads_entry(
+        entry("@ARTICLE{X, author = {{Balaguera-Antol{\\'\\i}nez}, A.}, title = {BAM}, year = {2019}}"),
+        "@ARTICLE{X, author = {{Balaguera-Antol{\\'\\i}nez}, A.}, title = {BAM}, year = {2019}}",
+    )
+    assert not check_ads_bib.key_conflicts("Balaguera-Antolinez_2019", ads)
+    # And the letter rule must not eat a real command.
+    assert check_ads_bib.normalized_identity_value(r"\lambda CDM") == "cdm"
+    assert check_ads_bib.normalized_identity_value(r"M_\odot") == "m_"
+
+
+def test_a_separated_key_is_still_read():
+    """A whole bibliography written `Surname_Year` must not read as zero keys:
+    that silently switches off the one check independent of the entry's fields."""
+    ads = parsed_ads_entry(
+        entry("@ARTICLE{X, author = {{Li}, Siyang and {Riess}, A.}, title = {Tip of the Red Giant Branch}, year = {2024}}"),
+        "@ARTICLE{X, author = {{Li}, Siyang and {Riess}, A.}, title = {Tip of the Red Giant Branch}, year = {2024}}",
+    )
+    # The key names the given name, not the surname - the real find in a real file.
+    assert check_ads_bib.key_conflicts("Siyang_2024", ads)
+    assert not check_ads_bib.key_conflicts("Li_2024", ads)
+    assert not check_ads_bib.key_conflicts("Li2024", ads)
+    assert not check_ads_bib.key_conflicts("Li_2024B", ads)
+    # Still not a `Surname+year` key, so still nothing to compare against.
+    for key in ("megamaser", "DES_Y3", "Planck_2020_cosmo", "Stiskalek_Cepheids"):
+        assert not check_ads_bib.CITATION_KEY_RE.match(key), key
+
+
 def test_matching_key_is_clean():
     local = entry(
         """@ARTICLE{Rafraf2021,
@@ -682,6 +719,129 @@ def test_a_preprint_adsurl_still_offers_the_published_record():
     assert result.status == "ADS_BIBTEX_MISMATCH", (result.status, result.message)
     assert result.ads_bibtex, "no replacement was offered"
     assert asked == ["2020A&A...641A...6P"], f"asked ADS for the alias, not the record: {asked}"
+
+
+def test_a_merged_preprint_is_not_reported_as_a_different_paper():
+    """The other half: ADS folded the two records into one, so the entry's own
+    identifiers resolve straight to the journal record and only the DOI disagrees."""
+    local = entry(
+        """@ARTICLE{Valade2026, author = {{Valade}, A. and {Libeskind}, N.},
+           title = {Constraining cosmological simulations with peculiar velocities},
+           journal = {arXiv e-prints}, year = {2026}, doi = {10.48550/arXiv.2602.03699},
+           eprint = {2602.03699},
+           adsurl = {https://ui.adsabs.harvard.edu/abs/2026arXiv260203699V}}"""
+    )
+    # One record, answering to the preprint's identifiers as well as its own.
+    doc = {"bibcode": "2026A&A...712A.101V", "year": "2026",
+           "title": ["Constraining cosmological simulations with peculiar velocities"],
+           "identifier": ["2026arXiv260203699V", "2026A&A...712A.101V", "arXiv:2602.03699",
+                          "10.48550/arXiv.2602.03699", "10.1051/0004-6361/202600001"]}
+    export = """@ARTICLE{2026A&A...712A.101V, author = {{Valade}, A. and {Libeskind}, N.},
+           title = {Constraining cosmological simulations with peculiar velocities},
+           journal = {\\aap}, year = {2026}, doi = {10.1051/0004-6361/202600001}, eprint = {2602.03699}}"""
+    check_ads_bib.reset_ads_run_cache()
+    check_ads_bib.ADS_CACHE = None
+    with patch.object(check_ads_bib, "ads_search", lambda *a, **k: [doc]), \
+         patch.object(check_ads_bib, "ads_export_bibtex_many", lambda codes, *a: {"2026A&A...712A.101V": export}):
+        result = check_entry(local, "token", 5, 5, 0)
+    assert result.status == "PREPRINT_PUBLISHED", (result.status, result.message)
+    assert "2026A&A...712A.101V" in result.message, result.message
+
+
+def test_a_real_record_conflict_survives_the_preprint_rule():
+    """Only a DOI/eprint disagreement is excused, and only for an arXiv entry."""
+    local = entry(
+        """@ARTICLE{Smith2020, author = {{Smith}, J.}, title = {A study of one thing},
+           journal = {MNRAS}, year = {2020}, doi = {10.1000/typo}}"""
+    )
+    doc = {"bibcode": "2020MNRAS.999....1J", "title": ["A study of one thing"], "year": "2020",
+           "identifier": ["2020MNRAS.999....1J", "10.1000/typo"]}
+    export = """@ARTICLE{2020MNRAS.999....1J, author = {{Smith}, J.}, title = {A study of one thing},
+           journal = {\\mnras}, year = {2020}, doi = {10.1000/real}}"""
+    check_ads_bib.reset_ads_run_cache()
+    check_ads_bib.ADS_CACHE = None
+    with patch.object(check_ads_bib, "ads_search", lambda *a, **k: [doc]), \
+         patch.object(check_ads_bib, "ads_export_bibtex_many", lambda codes, *a: {"2020MNRAS.999....1J": export}):
+        assert check_entry(local, "token", 5, 5, 0).status == "ADS_RECORD_CONFLICT"
+
+
+def test_an_unmerged_preprint_offers_the_published_record():
+    """The reproducer: both records exist, the preprint resolves perfectly, and
+    only a title search knows the paper is out."""
+    local = entry(
+        """@ARTICLE{Stiskalek2026, author = {{Stiskalek}, Richard and {Desmond}, Harry},
+           title = {Revisiting the Great Attractor}, journal = {arXiv e-prints}, year = {2026},
+           doi = {10.48550/arXiv.2601.08524}, eprint = {2601.08524},
+           adsurl = {https://ui.adsabs.harvard.edu/abs/2026arXiv260108524S}}"""
+    )
+    preprint = {"bibcode": "2026arXiv260108524S", "title": ["Revisiting the Great Attractor"], "year": "2026",
+                "identifier": ["2026arXiv260108524S", "arXiv:2601.08524", "10.48550/arXiv.2601.08524"]}
+    # ADS has not merged them, so the journal record answers to none of the
+    # entry's identifiers and comes back only from a title search.
+    journal = {"bibcode": "2026OJAp....957824S", "title": ["Revisiting the Great Attractor"], "year": "2026",
+               "pub": "The Open Journal of Astrophysics",
+               "identifier": ["2026OJAp....957824S", "10.33232/001c.157824"]}
+    exports = {
+        "2026arXiv260108524S": local.raw.replace("Stiskalek2026", "2026arXiv260108524S"),
+        "2026OJAp....957824S": """@ARTICLE{2026OJAp....957824S, author = {{Stiskalek}, Richard and {Desmond}, Harry},
+           title = {Revisiting the Great Attractor}, journal = {\\ojap}, year = {2026},
+           doi = {10.33232/001c.157824}, eprint = {2601.08524}}""",
+    }
+
+    def search(query, *args, **kwargs):
+        return [journal, preprint] if query.startswith("title:") else [preprint]
+
+    check_ads_bib.reset_ads_run_cache()
+    check_ads_bib.ADS_CACHE = None
+    with patch.object(check_ads_bib, "ads_search", search), \
+         patch.object(check_ads_bib, "ads_export_bibtex_many", lambda codes, *a: {c: exports[c] for c in codes}):
+        result = check_entry(local, "token", 5, 5, 0)
+    assert result.status == "PREPRINT_PUBLISHED", (result.status, result.message)
+    assert "2026OJAp....957824S" in result.message, result.message
+    # The venue is the journal's name, not the BibTeX macro for it.
+    assert "The Open Journal of Astrophysics 2026" in result.message, result.message
+    assert "10.33232/001c.157824" in result.ads_bibtex, result.ads_bibtex
+    # The published record is what a replacement would write, and what a duplicate
+    # of this paper elsewhere in the file has to collide with.
+    assert check_ads_bib.ads_replacement_bibcode(result) == "2026OJAp....957824S"
+
+
+def test_a_preprint_with_no_published_record_stays_ok():
+    """One title search per preprint, and a plain preprint keeps its clean verdict."""
+    local = entry(
+        """@ARTICLE{Smith2026, author = {{Smith}, J.}, title = {Only ever a preprint},
+           journal = {arXiv e-prints}, year = {2026}, eprint = {2601.00001},
+           adsurl = {https://ui.adsabs.harvard.edu/abs/2026arXiv260100001S}}"""
+    )
+    preprint = {"bibcode": "2026arXiv260100001S", "title": ["Only ever a preprint"], "year": "2026",
+                "identifier": ["2026arXiv260100001S", "arXiv:2601.00001"]}
+    export = local.raw.replace("Smith2026", "2026arXiv260100001S")
+    check_ads_bib.reset_ads_run_cache()
+    check_ads_bib.ADS_CACHE = None
+    with patch.object(check_ads_bib, "ads_search", lambda *a, **k: [preprint]), \
+         patch.object(check_ads_bib, "ads_export_bibtex_many", lambda codes, *a: {c: export for c in codes}):
+        assert check_entry(local, "token", 5, 5, 0).status == "OK"
+
+
+def test_a_different_paper_with_a_similar_title_is_not_an_upgrade():
+    """The title search is loose; the same identity check as every other route gates it."""
+    local = entry(
+        """@ARTICLE{Smith2026, author = {{Smith}, J.}, title = {A shared title},
+           journal = {arXiv e-prints}, year = {2026}, eprint = {2601.00001},
+           adsurl = {https://ui.adsabs.harvard.edu/abs/2026arXiv260100001S}}"""
+    )
+    preprint = {"bibcode": "2026arXiv260100001S", "title": ["A shared title"], "year": "2026",
+                "identifier": ["2026arXiv260100001S", "arXiv:2601.00001"]}
+    other = {"bibcode": "2026ApJ...1....1J", "title": ["A shared title"], "year": "2026"}
+    exports = {
+        "2026arXiv260100001S": local.raw.replace("Smith2026", "2026arXiv260100001S"),
+        "2026ApJ...1....1J": "@ARTICLE{2026ApJ...1....1J, author = {{Jones}, K.}, title = {A shared title}, year = {2026}}",
+    }
+    check_ads_bib.reset_ads_run_cache()
+    check_ads_bib.ADS_CACHE = None
+    with patch.object(check_ads_bib, "ads_search", lambda q, *a, **k: [other, preprint] if q.startswith("title:") else [preprint]), \
+         patch.object(check_ads_bib, "ads_export_bibtex_many", lambda codes, *a: {c: exports[c] for c in codes}):
+        assert check_entry(local, "token", 5, 5, 0).status == "OK"
 
 
 def test_a_failing_reference_resolver_keeps_the_missing_verdict():
