@@ -590,6 +590,32 @@ def test_the_app_is_the_default_but_never_in_a_pipe():
     assert not wants_review(parser.parse_args(["ref.bib", "--replace"]), interactive=True)
 
 
+def test_a_collaboration_key_is_not_a_wrong_paper():
+    """`CosmoVerse2025` resolves to a paper by Di Valentino. That is not a mismatch.
+
+    It used to conflict forever, and replacing could never clear it, because the
+    citation key is deliberately kept - so the app asked about it on every pass.
+    """
+    local = entry(
+        """@ARTICLE{CosmoVerse2025,
+           author = {{Di Valentino}, Eleonora and {Said}, Jackson Levi},
+           title = {The CosmoVerse White Paper: Addressing observational tensions},
+           year = {2025}}"""
+    )
+    assert identity_conflicts(local, parsed_ads_entry(local, local.raw)) == []
+
+    # The project name has to actually be in the title.
+    elsewhere = entry(
+        """@ARTICLE{CosmoVerse2025,
+           author = {{Di Valentino}, Eleonora}, title = {Something unrelated entirely}, year = {2025}}"""
+    )
+    assert identity_conflicts(elsewhere, parsed_ads_entry(elsewhere, elsewhere.raw)) == ["key"]
+
+    # And a short key must not be waved through by a chance substring.
+    short = entry("@ARTICLE{Li2020, author = {{Rafraf}, B.}, title = {A study of the lithium problem}, year = {2020}}")
+    assert identity_conflicts(short, parsed_ads_entry(short, short.raw)) == ["key"]
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

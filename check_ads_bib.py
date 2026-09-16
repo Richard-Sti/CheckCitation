@@ -1012,8 +1012,17 @@ def key_conflicts(key: str, ads_entry: BibEntry) -> bool:
     match = CITATION_KEY_RE.match(key)
     if not match:
         return False
-    if not names_agree(NON_ALNUM_RE.sub("", match.group("name").casefold()), first_author_surname(ads_entry.fields.get("author", ""))):
-        return True
+    name = NON_ALNUM_RE.sub("", match.group("name").casefold())
+    if not names_agree(name, first_author_surname(ads_entry.fields.get("author", ""))):
+        # A survey or collaboration key names the project, not the first author:
+        # `CosmoVerse2025` resolves to a paper by Di Valentino. The project name is
+        # in the title, so look there before calling it the wrong paper - otherwise
+        # the entry conflicts forever, and replacing it can never help, because the
+        # citation key is deliberately kept.
+        # ponytail: 4 characters, so a short surname like `Li` cannot be waved
+        # through by a chance substring of some title.
+        if len(name) < 4 or name not in alphanumeric_key(ads_entry.fields.get("title", "")):
+            return True
     ads_year = ads_entry.fields.get("year", "")
     # ponytail: +/-1 absorbs preprint-vs-journal year drift.
     return ads_year.isdigit() and abs(int(ads_year) - int(match.group("year"))) > 1

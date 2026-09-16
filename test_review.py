@@ -426,6 +426,78 @@ def test_two_bibliographies_never_share_acceptances():
         assert list(files[second]) == ["Jones2019"]
 
 
+def test_replacing_an_entry_never_puts_it_straight_back_in_the_queue():
+    """Some conflicts no rewrite can clear, so acting on one has to settle it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+            notice = item.replace("Smith2020", ADS_EXPORT)
+        smith = next(e for e in item.entries if e.key == "Smith2020")
+        assert item.is_accepted(smith), "the card would come straight back"
+        assert "marked checked" in notice, notice
+        payload = {e["key"]: e for e in item.payload()["entries"]}["Smith2020"]
+        assert payload["accepted"] is True
+        # And the acceptance is about the new text, so a later edit re-opens it.
+        item.path.write_text(item.path.read_text().replace("A study of galaxies", "Something else"))
+        item.refresh()
+        assert not item.is_accepted(next(e for e in item.entries if e.key == "Smith2020"))
+
+
+def test_undoing_a_replacement_also_undoes_the_acceptance():
+    """Undo is rejecting the replacement, so it must not leave the entry suppressed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        item = session(tmp, MISMATCH)
+        original = next(e for e in item.entries if e.key == "Smith2020").raw
+        with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+            item.replace("Smith2020", ADS_EXPORT)
+            assert item.is_accepted(next(e for e in item.entries if e.key == "Smith2020"))
+            notice = item.replace("Smith2020", original, settle=False)
+        smith = next(e for e in item.entries if e.key == "Smith2020")
+        assert smith.raw == original, "the file was not restored"
+        assert not item.is_accepted(smith), "an undone entry must come back to the queue"
+        assert "restored" in notice, notice
+
+
+def test_clearing_decisions_touches_only_this_bibliography():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp) / ".checked.json"
+        other = Path(tmp) / "other"
+        other.mkdir()
+        (other / "ref.bib").write_text(BIB)
+        neighbour = review.Review(other / "ref.bib", "token", store=store)
+        with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+            neighbour.refresh()
+        neighbour.accept("Smith2020")
+
+        path = Path(tmp) / "ref.bib"
+        path.write_text(BIB)
+        item = review.Review(path, "token", store=store)
+        with patch.object(check_ads_bib, "check_entries_parallel", canned(MISMATCH)):
+            item.refresh()
+        item.accept("Smith2020")
+        item.accept("Jones2019")
+
+        base, get, post, stop = serving(item)
+        try:
+            payload = post("/api/clear", {})
+        finally:
+            stop()
+        assert "Cleared 2 decisions" in payload["notice"], payload["notice"]
+        assert not any(e["accepted"] for e in payload["entries"])
+        assert item.path.read_text() == BIB, "clearing decisions must not touch the .bib"
+        files = json.loads(store.read_text())["files"]
+        assert list(files) == [str((other / "ref.bib").resolve())], "the other bibliography lost its decisions"
+
+
+def test_the_page_is_not_told_to_run_a_command_line_flag():
+    """The card has buttons for exactly what ISSUE_ACTIONS describes."""
+    assert review.gui_action("ADS_RECORD_CONFLICT").startswith("Review the ADS-exported")
+    assert "--replace" not in review.gui_action("ADS_RECORD_CONFLICT")
+    assert all("--replace" not in review.gui_action(s) for s in check_ads_bib.STATUS_ORDER)
+    # Advice that is not about the flag is passed through untouched.
+    assert review.gui_action("RATE_LIMITED") == check_ads_bib.ISSUE_ACTIONS["RATE_LIMITED"]
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

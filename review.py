@@ -116,6 +116,13 @@ class Review:
         at = record.get("at")
         return isinstance(at, (int, float)) and time.time() - at <= ACCEPTED_TTL
 
+    def clear_accepted(self):
+        """Forget every decision recorded for this .bib. Other files keep theirs."""
+        count = len(self.accepted)
+        self.accepted = {}
+        self._save_accepted()
+        return f"Cleared {count} decision{'' if count == 1 else 's'} for {self.path.name}."
+
     def accept(self, key, accepted=True):
         """Record, or withdraw, "I looked at this one and it is fine"."""
         entry = self.entry_for(key)
@@ -196,8 +203,13 @@ class Review:
             raise ValueError(f"{len(matches)} entries share the key {key}; remove the duplicate first")
         return matches[0]
 
-    def replace(self, key, bibtex):
-        """Write one reviewed replacement into the .bib, keeping the citation key."""
+    def replace(self, key, bibtex, settle=True):
+        """Write one reviewed replacement into the .bib, keeping the citation key.
+
+        `settle` is false for an undo: putting the old text back is rejecting the
+        replacement, so it must also withdraw the acceptance the replacement made,
+        or the entry would be silently suppressed in the state you just restored.
+        """
         entry = self.entry_for(key)
         if entry is None:
             raise KeyError(f"no entry with key {key}")
@@ -212,7 +224,17 @@ class Review:
         ads.write_text_atomically(self.path, ads.apply_replacements(text, [(entry, replacement)]))
         self.replaced += 1
         self.refresh(recheck={key})
-        return f"{key} replaced; backup at {self.backup.name}"
+        # You have acted on this entry. If ADS still disagrees after the rewrite,
+        # it must not come straight back to the top of the queue - some conflicts
+        # no replacement can clear, because the citation key is kept by design.
+        if not settle:
+            self.accept(key, accepted=False)
+            return f"{key} restored to what was in the file"
+        settled = ""
+        if any(e.key == key and r.status in ads.ISSUE_STATUSES for e, r in self.results):
+            self.accept(key)
+            settled = "; it still differs from ADS, so it is marked checked rather than re-queued"
+        return f"{key} replaced; backup at {self.backup.name}{settled}"
 
     def payload(self, notice=""):
         counts = {}
@@ -238,6 +260,20 @@ class Review:
         }
 
 
+def gui_action(status):
+    """The report's advice, without the flag that names the other interface.
+
+    `ISSUE_ACTIONS` is written for the CLI, and the card has buttons for exactly
+    what it describes; telling someone to run --replace inside the app is noise.
+    """
+    action = ads.ISSUE_ACTIONS.get(status, "")
+    prefix = "use --replace to "
+    if action.startswith(prefix):
+        action = action[len(prefix):]
+        return action[:1].upper() + action[1:]
+    return action
+
+
 def describe(entry, result, accepted=False):
     """Everything the CLI prints about one entry, plus what it only computes and drops."""
     ads_entry = ads.parsed_ads_entry(entry, result.ads_bibtex) if result.ads_bibtex else None
@@ -252,7 +288,7 @@ def describe(entry, result, accepted=False):
         "message": result.message,
         "query": result.query,
         "issue": ads.ISSUE_DESCRIPTIONS.get(result.status, ""),
-        "action": ads.ISSUE_ACTIONS.get(result.status, ""),
+        "action": gui_action(result.status),
         "local": {field: entry.fields.get(field, "") for field in ADS_FIELDS},
         "bibcode": ads.ads_bibcode(entry) or "",
         "ads": {field: ads_entry.fields.get(field, "") for field in ADS_FIELDS} if ads_entry else None,
@@ -413,7 +449,7 @@ def handler_for(review):
 
         def _post(self):
             url = urlsplit(self.path)
-            if url.path not in {"/api/replace", "/api/recheck", "/api/accept"}:
+            if url.path not in {"/api/replace", "/api/recheck", "/api/accept", "/api/clear"}:
                 return self._send(404, "not found", "text/plain")
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
                 return self._error(400, "expected Content-Type: application/json")
@@ -438,6 +474,9 @@ def handler_for(review):
             if self.headers.get("If-Match") != review.revision():
                 return self._error(409, "The .bib changed since this tab loaded it. Reload, then retry the edit.")
 
+            if url.path == "/api/clear":
+                return self._state(review.clear_accepted())
+
             if url.path == "/api/accept":
                 key = body.get("key")
                 if not isinstance(key, str):
@@ -448,7 +487,7 @@ def handler_for(review):
             bibtex = body.get("bibtex")
             if not isinstance(key, str) or not isinstance(bibtex, str) or not bibtex.strip():
                 return self._error(400, "replace needs a key and a non-empty bibtex string")
-            return self._state(review.replace(key, bibtex))
+            return self._state(review.replace(key, bibtex, settle=not body.get("undo")))
 
         def log_message(self, *args):
             pass  # a request per keypress; the log is noise

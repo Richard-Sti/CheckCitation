@@ -188,6 +188,108 @@ function entry(over = {}) {
   console.log('ok: the card shows the entry it would overwrite, old key included');
 }
 
+/* ---- undo must tell the server it is an undo ---- */
+(async () => {
+  const sent = [];
+  const {read, call, set} = page({
+    fetch: async (url, options = {}) => {
+      sent.push(JSON.parse(options.body));
+      return {ok: true, status: 200, json: async () => ({
+        revision: 'r2', entries: [], counts: [], duplicates: [], warnings: [], tex: null,
+        replaced: 0, skipped: 0, source: 'ref.bib', notice: 'Smith2020 restored to what was in the file',
+      })};
+    },
+  });
+  set(`entries = ${JSON.stringify([entry()])}; revision = 'r1'; busy = false; drafts = {};`);
+  set("history = [{key: 'Smith2020', raw: '@ARTICLE{Smith2020, title = {old}}'}];");
+  await read('undo(0)');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].undo, true, 'without this the server records the restored entry as checked');
+  assert.equal(sent[0].bibtex, '@ARTICLE{Smith2020, title = {old}}', 'undo sends the text it is restoring');
+  assert.deepEqual(read('history'), [], 'and the entry leaves the undo list');
+  console.log('ok: undo restores the old text and withdraws the acceptance');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+
+(async () => {
+  // A refused undo must not take the only record of the previous text with it.
+  const {nodes, read, set} = page({
+    fetch: async () => ({ok: false, status: 409, json: async () => ({error: 'The .bib changed since this tab loaded it.'})}),
+  });
+  set(`entries = ${JSON.stringify([entry()])}; revision = 'r1'; busy = false; drafts = {}; stale = false;`);
+  set("history = [{key: 'Smith2020', raw: '@ARTICLE{Smith2020, title = {old}}'}];");
+  await read('undo(0)');
+  assert.equal(read('history').length, 1, 'the undo record survived a refused write');
+  assert.equal(read('history')[0].raw, '@ARTICLE{Smith2020, title = {old}}', 'and still holds the old text');
+  assert.match(nodes.note.textContent, /changed since this tab/);
+  console.log('ok: a refused undo keeps the text it was going to restore');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+
+/* ---- the stats are navigation, and the clear button appears only when useful ---- */
+{
+  const {nodes, read, call, set} = page();
+  set(`entries = ${JSON.stringify([
+    entry({key: 'A2020'}),
+    entry({key: 'B2019', status: 'OK', issueish: false}),
+    entry({key: 'C2018', accepted: true}),
+  ])}; replaced = 0; skipped = 0; history = []; drafts = {}; fetchedAuto = {}; confirming = null;`);
+  call('render');
+  assert.equal(nodes['s-ok'].textContent, 1);
+  assert.equal(nodes['s-issues'].textContent, 1, 'an accepted entry is not still outstanding');
+  assert.equal(nodes['s-accepted'].textContent, 1);
+  assert.equal(nodes['btn-clear'].hidden, false, 'there is something to clear');
+
+  nodes['all-rows'].rendered = [];
+  call('setFilter', 'accepted');
+  assert.equal(read('filter'), 'accepted');
+  assert.equal(nodes['all-rows'].rendered.length, 1, 'and the All view follows the filter');
+  assert.match(nodes['all-rows'].rendered[0], /C2018/, 'showing the one that was decided');
+
+  set(`entries = ${JSON.stringify([entry({key: 'A2020'})])};`);
+  call('render');
+  assert.equal(nodes['btn-clear'].hidden, true, 'nothing decided, nothing to clear');
+  assert.equal(nodes['clear-confirm'].hidden, true, 'and the confirm cannot be left open');
+  console.log('ok: stats drive the filter, and Clear decisions hides when there is nothing to clear');
+}
+
+/* ---- Save: only what is genuinely unapplied, and never past a confirmation ---- */
+{
+  const {call} = page();
+  const rows = [entry({key: 'A2020', raw: '@ARTICLE{A2020, title = {old}}'}), entry({key: 'B2019'})];
+  assert.deepEqual(call('pendingKeys', rows, {}), [], 'nothing typed, nothing pending');
+  assert.deepEqual(call('pendingKeys', rows, {A2020: '  @ARTICLE{A2020, title = {old}}  '}), [],
+    'text identical to the file is not an edit');
+  assert.deepEqual(call('pendingKeys', rows, {A2020: '@ARTICLE{A2020, title = {new}}'}), ['A2020']);
+  assert.deepEqual(call('pendingKeys', rows, {Gone2000: 'whatever'}), [],
+    'a draft for an entry that no longer exists is not pending');
+  console.log('ok: only text you typed and have not applied counts as unsaved');
+}
+
+(async () => {
+  const sent = [];
+  const {nodes, read, call, set} = page({
+    fetch: async (url, options = {}) => {
+      sent.push(JSON.parse(options.body));
+      return {ok: true, status: 200, json: async () => ({
+        revision: 'r2', entries: [], counts: [], duplicates: [], warnings: [], tex: null,
+        replaced: 1, skipped: 0, source: 'ref.bib', notice: 'saved',
+      })};
+    },
+  });
+  const rows = [
+    entry({key: 'Safe2020', auto: true, raw: '@ARTICLE{Safe2020, title = {old}}'}),
+    entry({key: 'Risky2019', auto: false, conflicts: ['title'], raw: '@ARTICLE{Risky2019, title = {old}}'}),
+  ];
+  set(`entries = ${JSON.stringify(rows)}; source = 'ref.bib'; revision = 'r1'; busy = false;`);
+  set("deferred = []; focus = []; fetchedAuto = {}; history = []; confirming = null;");
+  set("drafts = {Safe2020: '@ARTICLE{Safe2020, title = {new}}', Risky2019: '@ARTICLE{Risky2019, title = {new}}'};");
+
+  await read('saveAll()');
+  assert.deepEqual(sent.map(s => s.key), ['Safe2020'], 'a risky edit must not be written in bulk');
+  assert.deepEqual(read('focus'), ['Risky2019'], 'it goes to the front of the queue instead');
+  assert.match(nodes.note.textContent, /confirm each on its card/);
+  console.log('ok: Save writes the vetted edits and refuses to bulk-apply a risky one');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+
 /* ---- the handoff, for entries no route resolved ---- */
 {
   const {call} = page();

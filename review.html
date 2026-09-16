@@ -53,7 +53,10 @@ main:has(#view-all:not([hidden])) { max-width:1040px }
 /* The 1px gap is the hairline between stats. */
 .stats { display:grid; grid-template-columns:repeat(5,1fr); gap:1px; background:var(--line);
          border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:14px }
-.stat { background:var(--card); padding:9px 12px }
+.stat { background:var(--card); padding:9px 12px; border:0; width:100%; display:block;
+        text-align:left; font:inherit; color:inherit; cursor:pointer }
+.stat:hover { background:var(--bg) }
+.stat:focus-visible { outline:2px solid var(--ink); outline-offset:-2px }
 .stat b { display:block; font-size:19px; font-variant-numeric:tabular-nums; font-weight:600 }
 .stat span { font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim) }
 .stat.s-ok b { color:var(--ok) } .stat.s-bad b { color:var(--bad) }
@@ -116,7 +119,9 @@ h3 { font-size:13.5px; margin:18px 0 6px }
   <h1>ADS citation review</h1>
   <span id="source"></span>
   <span class="spacer"></span>
+  <button class="btn good" id="btn-save" hidden>Save</button>
   <button class="btn" id="btn-recheck">Re-check</button>
+  <button class="btn" id="btn-clear" hidden>Clear decisions</button>
   <button class="btn" id="btn-reload" hidden>Reload from disk</button>
   <nav>
     <button id="tab-review" aria-pressed="true">Review<b id="n-review"></b></button>
@@ -129,17 +134,23 @@ h3 { font-size:13.5px; margin:18px 0 6px }
   <p id="note" role="status"></p>
 
   <div class="stats">
-    <div class="stat s-ok"><b id="s-ok">0</b><span>Agrees with ADS</span></div>
-    <div class="stat s-bad"><b id="s-issues">0</b><span>Needs a decision</span></div>
-    <div class="stat"><b id="s-accepted">0</b><span>Checked and fine</span></div>
-    <div class="stat"><b id="s-replaced">0</b><span>Replaced</span></div>
-    <div class="stat"><b id="s-skipped">0</b><span>Not checked</span></div>
+    <button class="stat s-ok" data-stat="ok"><b id="s-ok">0</b><span>Agrees with ADS</span></button>
+    <button class="stat s-bad" data-stat="issues"><b id="s-issues">0</b><span>Needs a decision</span></button>
+    <button class="stat" data-stat="accepted"><b id="s-accepted">0</b><span>Checked and fine</span></button>
+    <button class="stat" data-stat="replaced"><b id="s-replaced">0</b><span>Replaced</span></button>
+    <button class="stat" data-stat="skip"><b id="s-skipped">0</b><span>Not checked</span></button>
+  </div>
+
+  <div class="confirm" id="clear-confirm" hidden>
+    Forget every decision recorded for this bibliography? The .bib itself is not touched.
+    <button class="btn danger" id="btn-clear-yes">Yes, clear them</button>
+    <button class="btn" id="btn-clear-no">Cancel</button>
   </div>
 
   <section id="view-review">
     <p class="lead">Entries ADS disagrees with, in file order. The citation key is always kept;
       only the entry body is rewritten, behind one backup per session. Marking one
-      <em>checked</em> is remembered beside the .bib, so it is not raised again until you edit it.</p>
+      <em>checked</em> is remembered between runs, so it is not raised again until you edit it.</p>
     <div id="card"></div>
     <p class="empty" id="review-empty" hidden>Nothing left to decide.</p>
     <h3 id="recent-head" hidden>Replaced this session</h3>
@@ -249,6 +260,16 @@ function matchList(entry) {
 // judge a proposal without the thing it would overwrite.
 function currentEntry(entry) {
   return `<h3>Current entry, line ${entry.line}</h3><pre class="bib">${esc(entry.raw)}</pre>`;
+}
+
+// Text you typed or fetched into a card but have not applied. Everything else is
+// already on disk: a replacement is written the moment it is accepted.
+function pendingKeys(entries, drafts) {
+  return Object.keys(drafts).filter(key => {
+    const entry = entries.find(e => e.key === key);
+    const text = (drafts[key] || '').trim();
+    return !!entry && !!text && text !== entry.raw.trim();
+  });
 }
 
 // Nothing resolved, so the card stops proposing and starts helping the user look.
@@ -370,28 +391,55 @@ async function recheck() {
   }
 }
 
-async function replace(key, bibtex) {
-  if (busy || !bibtex || !bibtex.trim()) return;
+async function replace(key, bibtex, undo = false) {
+  if (busy || !bibtex || !bibtex.trim()) return false;
   const entry = byKey(entries, key);
   const previous = entry ? entry.raw : null;
   busy = true;
   confirming = null;
   note(`Replacing ${key}…`);
   try {
-    const res = await apiFetch('/api/replace', {method: 'POST', body: JSON.stringify({key, bibtex})});
+    const res = await apiFetch('/api/replace', {method: 'POST', body: JSON.stringify({key, bibtex, undo})});
     if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
     adopt(res.body);
-    if (previous) history.unshift({key, raw: previous});
+    // An undo is not something to undo again; the list means "replacements you made".
+    if (previous && !undo) history.unshift({key, raw: previous});
     // Only drop the draft once the server took it, and only if nothing was typed
     // in the meantime.
     if (drafts[key] === bibtex) { delete drafts[key]; persistDrafts(); }
     note(res.body.notice || `${key} replaced.`);
+    return true;
   } catch (e) {
     note(e.message, true);
+    return false;
   } finally {
     busy = false;
     render();
   }
+}
+
+async function saveAll() {
+  const keys = pendingKeys(entries, drafts);
+  if (!keys.length || busy) return;
+  // A bulk save must not slip a possible different paper past the confirmation a
+  // single card would demand; those are pushed to the front of the queue instead.
+  const risky = keys.filter(key => {
+    const entry = byKey(entries, key);
+    return !entry || !(entry.auto || fetchedAuto[key]);
+  });
+  let saved = 0;
+  for (const key of keys.filter(key => !risky.includes(key))) {
+    await replace(key, drafts[key]);
+    if (!drafts[key]) saved += 1;
+  }
+  if (risky.length) {
+    focus = [...risky, ...focus.filter(key => !risky.includes(key))];
+    tab('review');
+    note(`Saved ${saved} to ${source}. ${risky.length} may be a different paper; confirm each on its card.`, true);
+  } else {
+    note(`Saved ${saved} edit${saved === 1 ? '' : 's'} to ${source}.`);
+  }
+  render();
 }
 
 async function accept(key, accepted) {
@@ -415,9 +463,10 @@ async function accept(key, accepted) {
 async function undo(index) {
   const item = history[index];
   if (!item || busy) return;
-  history.splice(index, 1);
-  await replace(item.key, item.raw);
-  note(`${item.key} restored to what was in the file.`);
+  // Undo is a replacement back to the old text, and must not record it as checked.
+  // Forget it only once the file is actually back: a refused write - a stale tab,
+  // say - must not take the one record of the previous text with it.
+  if (await replace(item.key, item.raw, true)) history.splice(index, 1);
 }
 
 async function fetchExport(key, bibcode) {
@@ -446,10 +495,16 @@ function stats() {
   const ok = entries.filter(e => e.status === 'OK').length;
   $('s-ok').textContent = ok;
   $('s-issues').textContent = entries.filter(e => e.issueish && !e.accepted).length;
-  $('s-accepted').textContent = entries.filter(e => e.accepted).length;
+  const decided = entries.filter(e => e.accepted).length;
+  $('s-accepted').textContent = decided;
+  $('btn-clear').hidden = decided === 0;
+  if (!decided) $('clear-confirm').hidden = true;
   $('s-replaced').textContent = replaced;
   $('s-skipped').textContent = skipped;
-  $('source').textContent = source;
+  const pending = pendingKeys(entries, drafts).length;
+  $('source').textContent = pending ? `${source} · ${pending} unsaved` : `${source} · saved`;
+  $('btn-save').hidden = pending === 0;
+  $('btn-save').textContent = `Save ${pending} edit${pending === 1 ? '' : 's'} to ${source}`;
   $('n-review').textContent = queueKeys(entries, deferred, focus).length || '';
   $('n-all').textContent = entries.length || '';
   $('n-check').textContent = (dupes.length + warns.length + (tex ? tex.undefined.length : 0)) || '';
@@ -620,6 +675,30 @@ function act(what) {
   render();
 }
 
+function setFilter(name) {
+  filter = name;
+  document.querySelectorAll('[data-filter]').forEach(chip =>
+    chip.setAttribute('aria-pressed', String(chip.dataset.filter === name)));
+  render();
+}
+
+async function clearDecisions() {
+  if (busy) return;
+  busy = true;
+  note('Clearing decisions…');
+  try {
+    const res = await apiFetch('/api/clear', {method: 'POST', body: '{}'});
+    if (!res.ok) throw new Error(res.body.error || `HTTP ${res.status}`);
+    adopt(res.body);
+    note(res.body.notice || '');
+  } catch (e) {
+    note(e.message, true);
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
 function tab(name) {
   VIEWS.forEach(v => {
     $('view-' + v).hidden = v !== name;
@@ -629,12 +708,29 @@ function tab(name) {
 
 VIEWS.forEach(v => $('tab-' + v).onclick = () => tab(v));
 
-document.querySelectorAll('[data-filter]').forEach(el => el.onclick = () => {
-  filter = el.dataset.filter;
-  document.querySelectorAll('[data-filter]').forEach(b =>
-    b.setAttribute('aria-pressed', String(b === el)));
-  render();
+document.querySelectorAll('[data-filter]').forEach(el =>
+  el.onclick = () => setFilter(el.dataset.filter));
+
+// Every stat is a way in: click it to see which entries it counts.
+document.querySelectorAll('[data-stat]').forEach(el => el.onclick = () => {
+  el.blur();
+  if (el.dataset.stat === 'replaced') {
+    tab('review');
+    $('recent-head').scrollIntoView?.({block: 'start'});
+    return;
+  }
+  setFilter(el.dataset.stat);
+  tab('all');
 });
+
+$('btn-save').onclick = e => { e.currentTarget.blur(); saveAll(); };
+$('btn-clear').onclick = e => { e.currentTarget.blur(); $('clear-confirm').hidden = false; };
+$('btn-clear-no').onclick = () => { $('clear-confirm').hidden = true; };
+$('btn-clear-yes').onclick = e => {
+  e.currentTarget.blur();
+  $('clear-confirm').hidden = true;
+  clearDecisions();
+};
 
 document.querySelectorAll('[data-sort]').forEach(select => {
   const options = [['default', 'File order'], ['key:asc', 'Key: A–Z'], ['key:desc', 'Key: Z–A'],

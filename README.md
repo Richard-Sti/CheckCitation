@@ -96,7 +96,12 @@ the usual check runs, the usual report prints, and then a local page is served a
 <http://localhost:8766>. Stdlib only, bound to `127.0.0.1`, no build step
 and nothing to install. The only file it writes is the `.bib` you pointed it at.
 
-Three views under a stats strip:
+Three views under a stats strip. **Every stat is a way in**: click *Checked and
+fine* to see exactly which entries you accepted, *Needs a decision* for what is
+still open, *Replaced* to jump to this session's replacements. **Clear decisions**
+in the header appears whenever there is something to forget, asks once, and drops
+every recorded verdict for this bibliography — the `.bib` itself is never touched,
+and no other bibliography's decisions are affected.
 
 - **Review** — one card per entry ADS disagrees with, in file order. Each card shows
   the issue in the report's own words, the local entry against the ADS export field
@@ -115,6 +120,19 @@ Every card that resolved arrives with the proposed BibTeX already in the box and
 every ADS record linked to its abstract page. A card that resolved nowhere says so
 and offers the ADS search to run instead, because at that point the tool has done
 what it can and finding the record is yours.
+
+Acting on an entry settles it: if ADS still disagrees after a replacement, the
+entry is marked checked rather than put straight back at the top of the queue.
+Some conflicts no rewrite can clear — a citation key is kept by design, so a key
+the record disagrees with would otherwise be raised for ever.
+
+**Replacements are written as you accept them** — there is no separate save step
+for those. The header says so: `ref.bib · saved`. What is *not* on disk is BibTeX
+you typed or fetched into a card and have not applied; that lives in the browser
+until you act on it, so the header switches to `ref.bib · 3 unsaved` and a **Save
+3 edits to ref.bib** button appears. It writes the vetted ones and pushes anything
+that might be a different paper to the front of the queue instead of slipping it
+past the confirmation a single card would demand.
 
 The citation key is always kept, whatever the pasted or exported BibTeX says. One
 backup per session is written before the first replacement, and every write is
@@ -154,7 +172,9 @@ but their series numbering has to match exactly: `Paper I` and `Paper II` score
 The citation key check is the only signal independent of the entry's own fields:
 a key of the form `Surname2020` is compared against the record's first author and
 year, which is what catches an entry that is internally consistent but is simply
-the wrong paper. Disagreement is reported as `ADS_RECORD_CONFLICT` and the entry
+the wrong paper. A survey or collaboration key names the project rather than the
+author — `CosmoVerse2025` resolves to a paper by Di Valentino — so a key of four
+characters or more that appears in the record's title is accepted as well. Disagreement is reported as `ADS_RECORD_CONFLICT` and the entry
 is never offered as a one-keypress replacement.
 
 The report prints a summary and then clear issue blocks with the entry key,
@@ -215,7 +235,8 @@ Your own verdicts are kept too. **Checked, it is fine** on a card records the en
 in `.checked.json`, and it is not raised again for a month — on this run, the next
 one, or after a restart. It is keyed to the entry's exact text, so editing the entry
 withdraws the acceptance and puts it back in the queue; `↺ checked` in the **All**
-view withdraws it by hand. A damaged store is reported and left alone rather than
+view withdraws one by hand, **Clear decisions** drops them all, and undoing a
+replacement withdraws the acceptance that replacement recorded. A damaged store is reported and left alone rather than
 overwritten.
 
 That file lives **beside `check_ads_bib.py`, not beside your `.bib`**, with one
